@@ -9,27 +9,13 @@ Scalable humanitarian cash assistance platform built from the supplied master SR
 - Payments: fake simulated adapter only
 - AI/automation: API boundaries are closed for this phase
 
-## Run Backend
+## Run platform 
 
-```bash
-cd backend
-python -m venv .venv
-.venv\Scripts\activate
-pip install -r requirements.txt
-copy .env.example .env
-docker compose up -d postgres
-python manage.py migrate
-python manage.py createsuperuser
-python manage.py runserver
-```
-
-## Run Frontend
-
-```bash
-cd frontend
-npm install
-npm run dev
-```
+Download docker
+make sure that docker is open and running 
+than in vscode terminal just run: 
+docker compose up --build
+open locallhost
 
 ## Implemented Scope
 
