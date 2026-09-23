@@ -1,0 +1,1042 @@
+
+
+--- PAGE 1 ---
+Global Humanitarian Cash Assistance Platform (H-CAP) 
+Consolidated Master SRS and Software Design Document — 
+MVP 
+Prepared for: ATC Group 
+Document status: Consolidated and reconciled MVP baseline 
+Primary source of truth: This document 
+Technology boundary: React frontend, Django REST Framework, PostgreSQL, 
+AI/automation services 
+Payment boundary: Simulation only; no real funds, no real payment provider, and no 
+external payment domain server 
+MVP persistence boundary: Exactly 12 PostgreSQL tables 
+ 
+ 
+ 
+1. Executive Summary 
+H-CAP is a secure, multi-tenant web platform for managing humanitarian cash-assistance 
+operations from program setup through household intake, beneficiary review, eligibility and 
+enrollment decisions, simulated payment execution, complaints, post-distribution monitoring, 
+budgeting, reporting, and audit. 
+ 
+The MVP is deliberately constrained. React with TypeScript provides the staff-facing 
+frontend. Django and Django REST Framework provide authentication, tenant scoping, 
+authorization, validation, domain services, REST APIs, payment simulation, AI/automation 
+orchestration, and audit generation. PostgreSQL is the authoritative system of record. There 
+is no external payment domain server and the system does not move real money. 
+ 
+AI and automation are advisory and operational-support layers. Deterministic Django 
+validation runs first. Advisory AI may identify data-quality issues, possible duplicates, 
+anomalies, eligibility evidence, PDM themes, and report drafts. Automation may issue 
+reminders, route queues, calculate dashboards, execute bounded simulated retries, and 
+prepare work for staff. AI must not silently deny eligibility, accuse a person of fraud, approve 
+a high-impact decision, or mark a simulated payment successful without an authoritative 
+Django workflow and a recorded event. 
+ 
+The MVP uses exactly 12 persisted tables. To preserve that boundary, the eligibility result 
+remains part of enrollment, budget line items are stored as JSONB within budget, and PDM 
+responses are collected or summarized through application/API payloads rather than a 
+dedicated PDM table. Dedicated PDM persistence, dedicated AI-signal persistence, and 
+reconciliation-item persistence are Phase 2 extensions. 
+ 
+
+
+--- PAGE 2 ---
+ 
+ 
+2. Reconciliation Decisions 
+The supplied material contained several incompatible counts and technology statements. The 
+following decisions are now authoritative for the MVP. 
+ 
+Topic Final MVP decision 
+Frontend 
+React with TypeScript. The supplied HTML reference was not included in the received 
+files, so this document defines the redesign target rather than claiming to have 
+implemented a reference-based redesign. 
+Backend Django with Django REST Framework as a modular monolith. 
+Database PostgreSQL. The frontend never connects directly to PostgreSQL. 
+Payment Simulated entirely inside Django. Payment records represent instructions and simulated 
+events only. 
+Background 
+infrastructure 
+Not a required MVP dependency. Scheduled or queued work may run through Django 
+management commands or a later task runner. Redis/Celery are Phase 2 options, not 
+MVP requirements. 
+Persisted tables Exactly 12. The final list is in Section 9. 
+Eligibility 
+decision 
+Stored using enrollment.eligibility_status, approved_by, and approved_at; a separate 
+eligibility_decision table is Phase 2. 
+PDM Captured as controlled request/application data and summarized in dashboards during 
+the MVP; a pdm_response table is Phase 2. 
+Budget lines Stored as a JSONB array in budget; a separate budget_line table is Phase 2. 
+AI signals review payloads during the MVP. 
+External 
+providers 
+No real provider integration. Channel configuration describes the simulated channel 
+only. 
+Sensitive data Store only the minimum needed. National identifiers are hashed when required; full 
+phone numbers are stored in the MVP. 
+ 
+ 
+
+
+--- PAGE 3 ---
+3. Product Scope and Objectives 
+3.1 MVP objectives 
+The MVP must demonstrate one coherent vertical workflow rather than a collection of 
+disconnected screens. Staff must be able to create a program, register a household and 
+beneficiaries, record consent and verification, review eligibility, approve enrollment, create a 
+simulated payment instruction, execute and inspect simulated payment events, handle 
+complaints, inspect budget status, review PDM summaries, and inspect audit history. 
+ 
+The platform must be tenant-aware from the beginning. Every operational query must be 
+restricted to the authenticated user’s tenant unless a future, explicitly authorized cross-tenant 
+reporting policy is introduced. 
+ 
+The frontend must be suitable for field and operations staff. It should be responsive, low-
+bandwidth conscious, keyboard accessible, and prepared for English and Arabic labels and 
+right-to-left layout. 
+ 
+3.2 Out of scope for the MVP 
+The MVP does not include real payment processing, custody of funds, bank or mobile-money 
+credentials, external payment APIs, a separate payment domain server, a configurable 
+workflow-rule database, offline synchronization, exchange-rate management, a dedicated 
+reconciliation table, multi-step approval chains, or a dedicated AI-signal table. 
+ 
+ 
+ 
+4. Users and Staff Responsibilities 
+Staff roles are explicit system actors. The React interface must display the current role and 
+tenant context and must hide actions that the role cannot perform. Django remains the final 
+authority for authorization. 
+ 
+Staff role Main responsibilities High-impact restrictions 
+Tenant administrator Manage tenant users, programs, simulated 
+channels, budgets, and access. 
+Cannot bypass validation or directly 
+set a successful payment status. 
+Field officer 
+Register households and beneficiaries, 
+capture consent, submit verification 
+information, and enter permitted complaints 
+or PDM information. 
+Cannot approve their own high-
+impact records unless a documented 
+pilot policy allows it. 
+
+
+--- PAGE 4 ---
+Staff role Main responsibilities High-impact restrictions 
+Reviewer 
+Review beneficiary evidence, inspect 
+advisory AI outputs, record eligibility status, 
+and approve or reject enrollment. 
+Must make the authoritative 
+eligibility/enrollment decision; AI 
+cannot do it. 
+Finance/distribution 
+officer 
+Configure simulated channels, create 
+payment instructions for approved 
+enrollments, run simulations, inspect failures, 
+and initiate bounded retries. 
+Cannot invoke any real provider or 
+claim that funds were transferred. 
+Support/complaints 
+officer 
+Register, assign, investigate, and resolve 
+complaints; enter permitted PDM 
+information. 
+Cannot alter immutable payment or 
+audit history. 
+Manager/auditor 
+Inspect dashboards, budgets, payment 
+histories, PDM summaries, complaints, 
+reports, and audit records. 
+Read-focused access; cannot alter 
+immutable history. 
+The diagrams explicitly draw these staff actors and their hand-offs: architecture, workflow, 
+and AI review flow. 
+ 
+ 
+ 
+5. System Architecture 
+5.1 Logical architecture 
+The system consists of four logical areas, with the last three implemented within the 
+application boundary: 
+ 
+1 Staff and React presentation. Authorized staff use dashboards, forms, queues, 
+timelines, and AI/automation pages. 
+2 Django REST and domain services. Django authenticates requests, resolves tenant 
+and role, validates payloads, executes state transitions, runs the simulated payment 
+service, calls AI/automation services, and writes audit records. 
+3 AI and automation services. These services produce advisory outputs and 
+deterministic operational actions. They do not own authoritative beneficiary, 
+eligibility, enrollment, or payment outcomes. 
+4 PostgreSQL system of record. PostgreSQL stores the 12-table MVP model and 
+append-only payment and audit history. 
+ 
+
+
+--- PAGE 5 ---
+ 
+ 
+Editable source: 01-architecture.mmd. 
+ 
+5.2 Architectural rules 
+The frontend may perform client-side validation for immediate feedback, but Django must 
+repeat validation and is the authoritative validation layer. The frontend must never submit an 
+arbitrary status transition for direct persistence. High-impact changes must call a domain 
+service that validates the current state, actor role, tenant scope, required relationships, and 
+idempotency conditions. 
+ 
+The payment simulator is an internal Django service. It creates a payment instruction and 
+appends simulated payment events such as CREATED, SUBMITTED, SUCCESS, FAILED, 
+and REVERSED. It never calls a bank, mobile-money provider, cash agent, voucher system, 
+or external payment domain server. 
+ 
+The database must protect tenant scope through foreign keys, application-level query 
+scoping, object-level permission checks, and indexes. Audit events and payment events are 
+append-only at the application and database-permission levels. 
+ 
+5.3 Suggested Django application layout 
+hcap/ 
+  accounts/       authentication and staff roles 
+  tenants/        tenant context and scoping 
+  programs/       programs, channels, budgets 
+  intake/         households and beneficiaries 
+  enrollment/     eligibility status and enrollment approval 
+  payments/       simulated instructions and events 
+  complaints/     complaint cases 
+  audit/          append-only audit events 
+  automation/     deterministic jobs and advisory AI services 
+  api/            serializers, permissions, viewsets, URLs 
+ 
+
+
+
+--- PAGE 6 ---
+ 
+ 
+6. Frontend Design Baseline 
+The React frontend is organized around operational workflows, not merely around database 
+tables. The redesign target is a neutral public-sector/humanitarian interface that does not 
+imitate protected agency branding. 
+ 
+6.1 Visual language 
+Use deep institutional blue for navigation and headings, lighter blue for selected states and 
+links, white cards for operational content, and a neutral gray page background. Use green for 
+verified or successful states, amber for pending review or attention required, red for failure or 
+safeguarding-critical issues, and gray for inactive or closed states. Every status must include 
+text; color must never be the only signal. 
+ 
+The desktop layout uses a left navigation rail, a top bar showing tenant and user context, and 
+a main content area with summary cards, filters, tables, timelines, and one clear primary 
+action. Tablet layouts collapse the rail while preserving large touch targets. Registration and 
+PDM forms use short steps and show validation beside the relevant field. 
+ 
+6.2 Main React routes 
+Route Purpose Primary roles 
+/login Authenticate a staff user. All 
+/dashboard Show operational metrics and exception queues. All, filtered by role 
+/programs Create and manage programs and simulated 
+channels. Admin, finance, manager 
+/intake/households Register and search households. Field, admin 
+/intake/beneficiaries Register beneficiaries, consent, and verification. Field, reviewer 
+/eligibility Inspect evidence, AI suggestions, and eligibility 
+status. Reviewer 
+/enrollment Approve or reject enrollment. Reviewer 
+
+
+--- PAGE 7 ---
+Route Purpose Primary roles 
+/payments Create simulated instructions and inspect event 
+timelines. Finance, manager, auditor 
+/pdm Enter or summarize monitoring responses. Support, field, manager 
+/complaints Register, assign, investigate, and resolve cases. Support, manager 
+/budgets View budget envelope and JSONB line-item 
+summaries. Admin, finance, manager 
+/audit Search restricted audit history. Admin, manager, auditor 
+/assistant Ask questions about authorized operational data. All permitted roles 
+/automation View tasks, signals, drafts, and permitted controls. Admin, reviewer, finance, 
+manager 
+The supplied HTML reference was not part of the received attachment set. Therefore, the 
+implementation should use this design baseline until the HTML file is supplied for a 
+reference-specific redesign. 
+ 
+6.3 Dashboard contents 
+The dashboard should show active programs, pending eligibility reviews, approved 
+enrollments, simulated payment exceptions, PDM completion, open complaints, and budget 
+utilization. Each card must link to a filtered record list that explains the metric. Sensitive 
+beneficiary data is masked by default and revealed only when the role and action require it. 
+ 
+ 
+ 
+7. End-to-End Operational Workflow 
+5 The tenant administrator creates a program, sets currency, transfer amount, payment 
+cycle, simulated channel, and budget envelope. 
+6 The field officer registers a household and one or more beneficiaries. The officer 
+records consent and verification status. 
+7 Django validates the data. The advisory data-quality and duplicate services may return 
+suggestions or possible-match flags. 
+
+
+--- PAGE 8 ---
+8 The reviewer examines the source data, supporting evidence, and advisory outputs. 
+The reviewer records eligibility_status on the enrollment path and approves or rejects 
+the enrollment. 
+9 The finance officer creates a payment instruction only for an approved enrollment. 
+Django generates a unique idempotency key. 
+10 Django runs the payment simulator. The simulator records append-only events and 
+updates the instruction’s current status according to controlled transitions. 
+11 Support or MEAL staff record permitted PDM information through the PDM API. 
+The MVP may calculate summaries without adding a PDM table. 
+12 Support staff register and resolve complaints. A complaint can reference a 
+beneficiary, a simulated payment instruction, or both. 
+13 Managers and auditors inspect dashboards, budget JSONB line items, simulated 
+payment histories, derived reconciliation views, complaints, PDM summaries, and 
+audit events. 
+14 The AI reporting copilot can generate a draft with source metrics. An authorized 
+human must verify and approve the draft before external use. 
+ 
+ 
+ 
+Editable source: 03-end-to-end-workflow.mmd. 
+ 
+ 
+ 
+8. Functional Requirements 
+ID Requirement Acceptance criterion 
+FR-
+01 Authentication A valid staff user can log in; invalid or missing credentials receive an 
+authorization error. 
+FR-
+02 Tenant isolation A user cannot read or modify records belonging to another tenant. 
+FR-
+03 Role-based access Django enforces role permissions on every protected endpoint. 
+FR-
+04 
+Program 
+management 
+Authorized staff can create, update, activate, pause, and close programs 
+using valid transitions. 
+FR-
+05 
+Channel 
+configuration 
+Authorized staff can configure simulated bank, mobile-money, cash, or 
+voucher channel labels without external integration. 
+
+
+
+--- PAGE 9 ---
+ID Requirement Acceptance criterion 
+FR-
+06 Household intake Field staff can create and search tenant-scoped households. 
+FR-
+07 Beneficiary intake Field staff can register beneficiaries, record consent, and set verification 
+status. 
+FR-
+08 
+Eligibility and 
+enrollment 
+Reviewers can record eligibility status and approve or reject enrollment 
+through controlled services. 
+FR-
+09 Payment instruction Finance staff can create an instruction only for an approved enrollment. 
+FR-
+10 Payment simulation Django can simulate success, failure, retry, and reversal events without 
+external HTTP calls. 
+FR-
+11 Idempotency Repeating a request with the same idempotency key cannot create a 
+duplicate instruction or event. 
+FR-
+12 Complaints Support staff can create, assign, update, and resolve complaint cases. 
+FR-
+13 PDM Permitted staff can submit PDM payloads and view derived summaries 
+without a dedicated MVP table. 
+FR-
+14 Budgets Staff can manage a budget envelope and JSONB line items and view 
+planned versus actual totals. 
+FR-
+15 Auditability High-impact actions create an append-only audit event with actor, entity, 
+before/after data, and timestamp. 
+FR-
+16 Import Authorized staff can import CSV/XLSX mappings while preserving client -
+generated identifiers. 
+FR-
+17 Data quality The system returns deterministic validation errors and advisory 
+completeness suggestions. 
+FR-
+18 Duplicate detection The system returns possible matches with factors and confidence; it never 
+merges automatically. 
+FR-
+19 Anomaly signals The system returns risk indicators with reason, severity, and rule/model 
+version; a signal is not a fraud finding. 
+FR-
+20 Assistant page Authorized users can ask scoped questions and receive answers with 
+sources, confidence, and human-review status. 
+FR-
+21 Automation page Authorized users can view tasks and execute permitted deterministic actions 
+or dry runs. 
+FR-
+22 AI reports Authorized users can generate draft reports with source metrics; approval is 
+human-controlled. 
+
+
+--- PAGE 10 ---
+ 
+ 
+9. Reconciled 12-Table MVP Data Model 
+The 12-table boundary is authoritative. The ERD is available as 04-erd.mmd and rendered as 
+04-erd.png. 
+ 
+# Table Purpose 
+1 tenant Organization boundary, default currency, active status, timestamps. 
+2 user Staff account, tenant, role, active status, timestamps. 
+3 program Assistance program, currency, transfer amount, cycle, dates, lifecycle 
+status. 
+4 household Household identity, size, location, registration date, client-generated 
+identifier. 
+5 beneficiary Person record, limited demographics, consent, verification, and operational 
+status. 
+6 enrollment Beneficiary-program relationship, eligibility status, enrollment status, 
+approval actor and time. 
+7 payment_channel_config Simulated channel type, provider label, currency, active status. 
+8 payment_instruction Approved simulated payment instruction, amount, currency, status, 
+provider reference, idempotency key. 
+9 payment_event Append-only simulated event history and optional redacted payload. 
+10 complaint Complaint case, category, description, severity, status, assignment, 
+resolution time. 
+11 budget Program budget envelope, currency, status, planned/actual totals, and 
+JSONB line items. 
+12 audit_event Append-only actor/action/entity history with redacted before/after JSONB. 
+9.1 Required relationships 
+tenant has many user, program, household, and audit_event records. program has many 
+household, enrollment, and payment_channel_config records and one MVP budget. 
+
+
+--- PAGE 11 ---
+household has many beneficiary records. beneficiary has many enrollment and complaint 
+records. enrollment authorizes many payment_instruction records, although normal 
+operations should enforce one active instruction per cycle. payment_instruction has many 
+payment_event records and may be referenced by complaints. user is recorded as creator, 
+approver, assignee, recorder, or audit actor where applicable. 
+ 
+9.2 Key constraints 
+All primary identifiers are UUIDs. Monetary values use NUMERIC(18,2) and must be 
+positive where applicable. Currency uses a three-character code. The program transfer 
+amount must be greater than zero. The enrollment relationship is unique for (program_id, 
+beneficiary_id). The payment idempotency key is unique. Tenant ownership must be verified 
+before every read and write. Audit and payment event records are append-only. 
+ 
+9.3 Budget line representation 
+The budget table contains a JSONB line_items field. Each item should contain a stable client-
+generated key, category, planned amount, actual amount, and optional notes. The API 
+validates that values are numeric, non-negative, and sum consistently with the budget policy. 
+A dedicated budget_line table is a Phase 2 normalization option. 
+ 
+9.4 PDM representation 
+The MVP exposes PDM submission and summary endpoints, but does not add a 
+pdm_response table. During the demonstration, the service may retain redacted payloads in 
+controlled application storage or audit payloads and compute summaries from the submitted 
+request. If durable, queryable PDM history is required for production, add pdm_response in 
+Phase 2. 
+ 
+ 
+ 
+10. Payment Simulation Design 
+Payment is a demonstration workflow and not a financial integration. The simulated payment 
+service lives inside Django. 
+ 
+10.1 Allowed flow 
+DRAFT → CREATED → SUBMITTED → SUCCESS or FAILED; a successful or failed 
+instruction may later be marked REVERSED only through an explicitly authorized 
+simulation action. Every transition is validated by Django and appends a payment_event. 
+ 
+
+
+--- PAGE 12 ---
+10.2 Simulation controls 
+The finance page may offer controlled actions such as Simulate success, Simulate failure, 
+Retry, and Simulate reversal. Each action must show that it is a simulation. The interface 
+must never display provider settlement language, bank confirmation, or a claim that money 
+was received. 
+ 
+10.3 Safety rules 
+The service must not make outbound provider calls. A payment cannot be created unless the 
+enrollment is approved and the channel configuration is active. A repeated request with the 
+same idempotency key returns the existing instruction. A simulated success requires a 
+generated authoritative event and an audit event. 
+ 
+ 
+ 
+11. AI and Automation Design 
+11.1 Three-layer control model 
+ 
+ 
+Editable source: 02-ai-control-flow.mmd. 
+ 
+
+
+
+--- PAGE 13 ---
+Layer 1: deterministic validation. Django validators, business rules, tenant scope, 
+permissions, and status transitions run first. This layer does not use AI. 
+ 
+Layer 2: advisory AI and automation. Services produce suggestions, flags, confidence 
+scores, reminders, queue routing, bounded simulation retries, PDM themes, or draft reports. 
+ 
+Layer 3: human review and authoritative action. An authorized staff member evaluates 
+the evidence and records the authoritative decision through a Django service. The result and 
+any override are audited. 
+ 
+11.2 AI/automation modules 
+Module Inputs MVP output Human boundary 
+Data quality 
+Household, beneficiary, 
+program, and payment 
+payloads 
+Validation errors, 
+completeness score, 
+correction suggestions 
+Source record is corrected by 
+staff. 
+Duplicate 
+detection 
+Name, phone last four, 
+household, location, 
+program context 
+Candidate matches, 
+matching factors, 
+confidence 
+Reviewer investigates; no 
+automatic merge or denial. 
+Anomaly 
+detection 
+Amounts, references, 
+repeated instructions, 
+failure patterns 
+Risk flag, reason, severity, 
+rule/model version A risk flag is not a fraud finding. 
+Eligibility 
+assistance 
+Household, beneficiary, 
+program criteria, 
+previous records 
+Evidence summary, 
+missing-information 
+checklist 
+Reviewer sets final 
+eligibility/enrollment outcome. 
+Workflow 
+automation 
+Statuses, timestamps, 
+assignments 
+Reminders, routing, 
+escalation, overdue 
+queues 
+Staff can override; override is 
+audited. 
+Payment 
+simulation 
+Approved enrollment and 
+instruction 
+Simulated event and 
+bounded retry result 
+No real provider and no real 
+money. 
+PDM 
+intelligence 
+Submitted PDM 
+payloads and complaint 
+categories 
+Theme summaries and 
+operational patterns Staff validate findings before use. 
+Reporting 
+copilot 
+Authorized metrics and 
+date range 
+Draft narrative with 
+source metrics Human approval is required. 
+Assistant Scoped operational 
+records and user question 
+Answer, sources, 
+confidence, suggested 
+actions 
+Assistant cannot execute high-
+impact decisions from 
+conversation. 
+
+
+--- PAGE 14 ---
+11.3 AI governance requirements 
+Each advisory output should carry a model or rule version, input scope, generation time, 
+confidence where available, and a human-review indicator. The service must redact 
+unnecessary personal data before sending context to a model. If an AI service is unavailable, 
+the system must return a useful non-AI fallback such as deterministic validation results, a 
+manual-review queue, or a report template. 
+ 
+The assistant must not expose raw national identifiers, full phone numbers, passwords, 
+unrestricted audit payloads, or another tenant’s data. The UI must label AI-generated content 
+as advisory. 
+ 
+ 
+ 
+12. Assistant and Automation Pages 
+The pages are React screens backed by Django REST APIs. The sequence diagram is 
+available as 05-assistant-automation-sequence.mmd and 05-assistant-automation-
+sequence.png. 
+ 
+12.1 Authentication headers 
+Authorization: Bearer <access_token> 
+Content-Type: application/json 
+ 
+Every endpoint checks authentication, tenant scope, role permissions, and payload validity. 
+ 
+12.2 Assistant context 
+GET /api/ai/assistant/context/ 
+ 
+Example response: 
+ 
+{ 
+  "page": "eligibility_review", 
+  "available_entities": ["beneficiary", "household", "program"], 
+  "user_role": "REVIEWER", 
+  "tenant_id": "tenant-uuid", 
+
+
+--- PAGE 15 ---
+  "ai_features": ["data_quality", "duplicate_check", 
+"eligibility_assist", "anomaly_flag"] 
+} 
+ 
+12.3 Ask the assistant 
+POST /api/ai/assistant/query/ 
+ 
+Request: 
+ 
+{ 
+  "page": "eligibility_review", 
+  "entity_type": "beneficiary", 
+  "entity_id": "beneficiary-uuid", 
+  "question": "Why was this beneficiary flagged?", 
+  "context": { 
+    "program_id": "program-uuid" 
+  } 
+} 
+ 
+Response: 
+ 
+{ 
+  "answer": "The record was flagged because the phone last four digits 
+match another beneficiary in the same household.", 
+  "sources": [ 
+    { 
+      "type": "beneficiary", 
+      "id": "other-beneficiary-uuid", 
+      "reason": "phone_last4_match" 
+    } 
+  ], 
+  "confidence": 0.82, 
+  "human_review_required": true, 
+  "suggested_actions": [ 
+    "Open duplicate review", 
+    "Reject AI flag", 
+    "Investigate further" 
+  ], 
+  "model_or_rule_version": "duplicate-rules-v1" 
+
+
+--- PAGE 16 ---
+} 
+ 
+12.4 List automation tasks 
+Because the MVP has exactly 12 persisted tables, automation tasks are application-level work 
+items. They may be derived from current records or retained in controlled application storage; 
+they are not an additional required database table. 
+ 
+GET /api/ai/automation/tasks/?status=pending&type=payment_retry 
+ 
+Example response: 
+ 
+{ 
+  "tasks": [ 
+    { 
+      "id": "task-uuid", 
+      "type": "payment_retry", 
+      "status": "PENDING", 
+      "entity_type": "payment_instruction", 
+      "entity_id": "instruction-uuid", 
+      "created_at": "2026-09-23T10:00:00Z", 
+      "attempts": 1, 
+      "max_attempts": 3, 
+      "simulation_only": true 
+    } 
+  ] 
+} 
+ 
+12.5 Run or dry-run an automation task 
+POST /api/ai/automation/tasks/{task_id}/run/ 
+ 
+Request: 
+ 
+{ 
+  "dry_run": false 
+} 
+
+
+--- PAGE 17 ---
+ 
+Example response: 
+ 
+{ 
+  "task_id": "task-uuid", 
+  "status": "COMPLETED", 
+  "result": { 
+    "action": "payment_retry", 
+    "outcome": "SIMULATED_SUCCESS", 
+    "payment_instruction_id": "instruction-uuid", 
+    "new_event_id": "event-uuid" 
+  }, 
+  "simulation_only": true, 
+  "audit_event_id": "audit-uuid" 
+} 
+ 
+When dry_run is true, the endpoint returns the planned action and validation results without 
+changing PostgreSQL. 
+ 
+12.6 List and review advisory signals 
+GET /api/ai/signals/?status=OPEN&entity_type=beneficiary 
+POST /api/ai/signals/{signal_id}/review/ 
+ 
+Request: 
+ 
+{ 
+  "decision": "reject", 
+  "note": "Reviewed source records; similar name is not the same person." 
+} 
+ 
+Response: 
+ 
+{ 
+  "signal_id": "signal-uuid", 
+  "status": "REVIEWED", 
+  "decision": "reject", 
+
+
+--- PAGE 18 ---
+  "reviewed_by": "reviewer-uuid", 
+  "override": true, 
+  "audit_event_id": "audit-uuid" 
+} 
+ 
+A signal review does not directly change eligibility or payment status. If a source record must 
+change, the reviewer uses the appropriate domain workflow. 
+ 
+12.7 Generate and approve a report draft 
+POST /api/ai/reports/draft/ 
+POST /api/ai/reports/draft/{draft_id}/approve/ 
+ 
+Draft request: 
+ 
+{ 
+  "report_type": "program_summary", 
+  "program_id": "program-uuid", 
+  "date_range": { 
+    "start": "2026-09-01", 
+    "end": "2026-09-23" 
+  } 
+} 
+ 
+Draft response: 
+ 
+{ 
+  "draft_id": "draft-uuid", 
+  "status": "DRAFT", 
+  "draft_text": "During the reporting period, the program registered 
+...", 
+  "sources": [ 
+    {"metric": "beneficiaries_registered", "value": 1200}, 
+    {"metric": "payments_simulated_success", "value": 1150} 
+  ], 
+  "human_approval_required": true 
+} 
+
+
+--- PAGE 19 ---
+ 
+Approval request: 
+ 
+{ 
+  "note": "Metrics verified against the dashboard and audit history." 
+} 
+ 
+Approval is allowed only for an authorized manager or administrator and must create an audit 
+event. 
+ 
+12.8 Role permissions 
+Endpoint Admin Field Reviewer Finance Support Manager/Auditor 
+Assistant 
+context/query Yes Limited Yes Limited Limited Yes 
+List automation 
+tasks Yes No Yes Yes No Yes 
+Run automation 
+task Yes No No Yes, permitted 
+task types No No 
+List AI signals Yes No Yes No No Yes 
+Review AI 
+signal No No Yes No No No 
+Generate report 
+draft Yes No No 
+Yes, 
+operational 
+draft 
+Yes, PDM 
+draft Yes 
+Approve report 
+draft Yes No No No No Yes 
+The backend must apply the least-privilege interpretation of this table and may further restrict 
+actions based on program assignment. 
+ 
+ 
+ 
+
+
+--- PAGE 20 ---
+13. REST API Baseline 
+Method and endpoint Purpose 
+POST /api/auth/login/ Authenticate a staff user. 
+GET /api/me/ Return current user, role, and tenant. 
+GET/POST /api/programs/ List or create programs. 
+PATCH /api/programs/{id}/ Update program details or valid lifecycle state. 
+GET/POST /api/programs/{id}/channels/ Manage simulated channel configurations. 
+GET/POST /api/households/ Register and query households. 
+GET/POST /api/beneficiaries/ Register and query beneficiaries. 
+GET/POST /api/enrollments/ Create enrollment and record eligibility/approval 
+workflow. 
+GET/POST /api/payment-instructions/ Create and view simulated instructions. 
+POST /api/payment-instructions/{id}/simulate/ Run a controlled simulated outcome. 
+GET /api/payment-instructions/{id}/events/ View append-only simulated event history. 
+GET/POST /api/complaints/ Register and query complaint cases. 
+PATCH /api/complaints/{id}/ Assign, update, or resolve a complaint. 
+GET/POST /api/budgets/ Manage program budget envelopes and JSONB line 
+items. 
+GET /api/reports/ Return deterministic dashboard/report data. 
+GET /api/audit-events/ Search permitted audit history. 
+
+
+--- PAGE 21 ---
+Method and endpoint Purpose 
+POST /api/imports/ Import mapped CSV/XLSX records with preserved client 
+identifiers. 
+GET/POST /api/ai/assistant/context/ and 
+/query/ Assistant page APIs. 
+GET /api/ai/automation/tasks/ and POST 
+.../{id}/run/ Automation page APIs. 
+GET /api/ai/signals/ and POST .../{id}/review/ Advisory signal review APIs. 
+POST /api/ai/reports/draft/ Generate a human-reviewable report draft. 
+All list endpoints require pagination and tenant-scoped filtering. Error responses should use a 
+consistent structure containing an error code, human-readable message, field errors where 
+applicable, and a correlation identifier. 
+ 
+ 
+ 
+14. Non-Functional Requirements 
+14.1 Security and privacy 
+Use Django’s secure password hashing and secure session/token handling. Use HTTPS in 
+deployment. Enforce tenant-scoped querysets and object-level permissions. Do not expose 
+password hashes, raw national IDs, full phone numbers, or unrestricted audit payloads to 
+React. Redact sensitive values in audit JSONB. Store secrets outside source control. 
+ 
+14.2 Reliability and integrity 
+Use database transactions around high-impact state changes. Enforce unique idempotency 
+keys. Make simulated payment retries bounded and repeat-safe. Preserve failed and reversed 
+events rather than overwriting them. Return visible failure states. Ensure audit generation is 
+part of the same transaction where the operation’s integrity requires it. 
+ 
+14.3 Usability and accessibility 
+Support keyboard navigation, visible focus, readable contrast, responsive tables, clear labels, 
+short forms, and status text in addition to color. Externalize English and Arabic labels from 
+the start and prepare the layout for RTL. 
+ 
+
+
+--- PAGE 22 ---
+14.4 Performance and low bandwidth 
+Use pagination, filtered queries, compact payloads, lazy loading for dashboards, and server-
+side aggregation for summary cards. Avoid sending unnecessary beneficiary details to the 
+browser. 
+ 
+14.5 Maintainability 
+Use modular Django apps, typed TypeScript API contracts, migrations, automated tests, 
+service-layer ownership of state transitions, and documented AI/automation interfaces. Keep 
+AI prompts, rule versions, and fallback behavior versioned in application code. 
+ 
+ 
+ 
+15. Testing and Acceptance Plan 
+15.1 Test levels 
+Unit tests cover Django models, validators, permissions, domain services, AI scoring 
+functions, and status transitions. Integration tests cover REST endpoints with PostgreSQL 
+transactions. End-to-end tests cover the staff workflow from program creation through 
+simulated payment and audit review. Security tests cover authentication, tenant isolation, 
+object-level access, injection resistance, and sensitive-data masking. AI tests cover advisory 
+behavior, confidence/source fields, human review, overrides, and non-AI fallback. 
+ 
+15.2 Priority test cases 
+ID Scenario Expected result 
+TC-
+01 Unauthenticated API request 401 Unauthorized. 
+TC-
+02 User reads another tenant’s beneficiary 403 or filtered 404; no data disclosure. 
+TC-
+03 Field officer approves enrollment Permission denied. 
+TC-
+04 Reviewer approves eligible enrollment Enrollment status changes and audit event is created. 
+TC-
+05 
+Payment instruction for unapproved 
+enrollment Validation error; no instruction created. 
+
+
+--- PAGE 23 ---
+ID Scenario Expected result 
+TC-
+06 Simulate payment success SUCCESS event and audit event created; no external 
+HTTP call. 
+TC-
+07 Repeat same idempotency key Existing instruction returned; no duplicate. 
+TC-
+08 Simulate failure then bounded retry Failure and retry events retained; attempt limit enforced. 
+TC-
+09 Duplicate candidate found Advisory signal returned; no automatic merge or denial. 
+TC-
+10 Reviewer rejects AI signal Signal review is recorded and override is audited. 
+TC-
+11 AI unavailable during assistant query Safe fallback response returned. 
+TC-
+12 Automation dry run Planned action returned; PostgreSQL unchanged. 
+TC-
+13 Automation task rerun after completion Idempotent result; no duplicate state change. 
+TC-
+14 Report draft generated Draft includes source metrics and approval-required flag. 
+TC-
+15 Unauthorized report approval Permission denied. 
+TC-
+16 Audit update/delete attempt Operation blocked. 
+TC-
+17 Budget JSONB line items invalid Field validation error; transaction rolled back. 
+TC-
+18 PDM summary request Summary is returned without adding a persisted PDM 
+table. 
+TC-
+19 Import with duplicate client ID Duplicate rejected or reported without corrupting 
+existing records. 
+TC-
+20 Arabic/RTL rendering Labels remain readable and layout direction changes 
+without data loss. 
+15.3 MVP acceptance gate 
+The MVP is acceptable when the complete staff workflow passes in a synthetic dataset, all 
+high-impact actions are tenant- and role-protected, simulated payments produce auditable 
+append-only events, AI outputs remain advisory, the Assistant and Automation pages work 
+
+
+--- PAGE 24 ---
+through authenticated APIs, and no test demonstrates an external payment call or movement 
+of real funds. 
+ 
+ 
+ 
+16. Reports and Operational Views 
+The MVP should provide deterministic reports for program summary, beneficiary 
+registration, eligibility/enrollment review, simulated payment instructions, simulated payment 
+event history, derived reconciliation support, PDM summary, complaint status, budget status, 
+audit history, and AI/anomaly review. AI can draft narrative text, but the underlying metrics 
+must come from authorized Django queries and the draft must remain visibly provisional 
+until approved by a human. 
+ 
+Derived reconciliation support compares payment instruction amount, currency, simulated 
+event status, provider-reference placeholder, and idempotency information. It is a 
+view/service in the MVP, not a separate persisted reconciliation table. 
+ 
+ 
+ 
+17. Delivery and Deployment Baseline 
+The MVP may be deployed as one Django application process behind a standard HTTPS-
+capable web server, with PostgreSQL as the database. React may be built and served as static 
+assets or hosted through the selected frontend delivery mechanism. The logical application 
+boundary remains Django REST plus PostgreSQL plus AI/automation services. No separate 
+payment domain server is needed. 
+ 
+Scheduled reminders, signal refreshes, or report jobs may initially run through Django 
+management commands or controlled administrative actions. A task runner and message 
+broker can be introduced later only if the operational workload requires it. 
+ 
+ 
+ 
+18. Phase 2 Extensions 
+Phase 2 may introduce a dedicated eligibility_decision table, pdm_response table, 
+budget_line table, ai_signal table, reconciliation-item table, configurable eligibility rules, 
+offline synchronization, multi-step approvals, exchange-rate management, durable report 
+snapshots, richer PDM questionnaires, and real provider integrations only after a separate 
+
+
+--- PAGE 25 ---
+security and operational authorization process. None of these extensions are required for the 
+MVP described here. 
+ 
+ 
+ 
+
+
+--- PAGE 26 ---
+19. Diagram Index 
+H-CAP architecture with staff roles 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+ 
+
+
+
+--- PAGE 27 ---
+Responsible AI control flow 
+ 
+ 
+
+
+
+--- PAGE 28 ---
+ 
+End-to-end staff workflow 
+ 
+12-table MVP ERD 
+ 
+ 
+ 
+ 
+
+
+
+--- PAGE 29 ---
+ 
+ 
+Assistant and Automation API sequence 
+ 
+ 
+ 
+ 
+ 
