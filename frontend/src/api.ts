@@ -28,6 +28,9 @@ async function request<T>(path: string, init: RequestInit = {}): Promise<T> {
   return response.json() as Promise<T>;
 }
 
+export type ApiList<T> = T[] | { results: T[] };
+export const listItems = <T,>(result: ApiList<T>) => Array.isArray(result) ? result : result.results;
+
 export const api = {
   async login(email: string, password: string) {
     const result = await request<{ user: PlatformUser; token: string }>("/auth/login/", {
@@ -38,8 +41,18 @@ export const api = {
     return result.user;
   },
   me: () => request<PlatformUser>("/me/"),
+  get: <T>(path: string) => request<T>(path),
   users: () => request<PlatformUser[] | { results: PlatformUser[] }>("/users/"),
   createUser: (payload: Pick<PlatformUser, "email" | "full_name" | "role"> & { password: string }) =>
     request<PlatformUser>("/users/", { method: "POST", body: JSON.stringify(payload) }),
+  list: <T>(resource: string) => request<ApiList<T>>(`/${resource}/`),
+  create: <T>(resource: string, payload: Record<string, unknown>) =>
+    request<T>(`/${resource}/`, { method: "POST", body: JSON.stringify(payload) }),
+  update: <T>(resource: string, id: string, payload: Record<string, unknown>) =>
+    request<T>(`/${resource}/${id}/`, { method: "PATCH", body: JSON.stringify(payload) }),
+  programChannel: <T>(programId: string, payload: Record<string, unknown>) =>
+    request<T>(`/programs/${programId}/channels/`, { method: "POST", body: JSON.stringify(payload) }),
+  simulatePayment: <T>(instructionId: string, outcome: "submit" | "success" | "failure" | "retry" | "reversal") =>
+    request<T>(`/payment-instructions/${instructionId}/simulate/`, { method: "POST", body: JSON.stringify({ outcome }) }),
   clearToken: () => localStorage.removeItem("hcap_token"),
 };

@@ -81,12 +81,22 @@ class HouseholdSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = ["tenant", "created_by", "created_at"]
 
+    def validate_program(self, program):
+        if program.tenant_id != self.context["request"].user.tenant_id:
+            raise serializers.ValidationError("Program belongs to another tenant")
+        return program
+
 
 class BeneficiarySerializer(serializers.ModelSerializer):
     class Meta:
         model = Beneficiary
         fields = "__all__"
         read_only_fields = ["created_by", "created_at"]
+
+    def validate_household(self, household):
+        if household.tenant_id != self.context["request"].user.tenant_id:
+            raise serializers.ValidationError("Household belongs to another tenant")
+        return household
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):
@@ -120,7 +130,7 @@ class PaymentInstructionSerializer(serializers.ModelSerializer):
     class Meta:
         model = PaymentInstruction
         fields = "__all__"
-        read_only_fields = ["created_by", "created_at", "status", "provider_reference"]
+        read_only_fields = ["created_by", "created_at", "status", "provider_reference", "idempotency_key"]
 
     def validate(self, attrs):
         enrollment = attrs["enrollment"]
@@ -152,6 +162,11 @@ class ComplaintSerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = ["created_by", "created_at", "resolved_at"]
 
+    def validate_beneficiary(self, beneficiary):
+        if beneficiary.household.tenant_id != self.context["request"].user.tenant_id:
+            raise serializers.ValidationError("Beneficiary belongs to another tenant")
+        return beneficiary
+
     def update(self, instance, validated_data):
         if validated_data.get("status") in {Complaint.Status.RESOLVED, Complaint.Status.CLOSED}:
             instance.resolved_at = timezone.now()
@@ -173,6 +188,11 @@ class BudgetSerializer(serializers.ModelSerializer):
             if float(item["planned_amount"]) < 0 or float(item["actual_amount"]) < 0:
                 raise serializers.ValidationError("Line item amounts must be non-negative")
         return value
+
+    def validate_program(self, program):
+        if program.tenant_id != self.context["request"].user.tenant_id:
+            raise serializers.ValidationError("Program belongs to another tenant")
+        return program
 
 
 class AuditEventSerializer(serializers.ModelSerializer):

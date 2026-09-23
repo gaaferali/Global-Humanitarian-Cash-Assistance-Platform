@@ -108,6 +108,18 @@ class TenantScopedModelViewSet(viewsets.ModelViewSet):
         audit(self.request.user, f"{serializer.Meta.model.__name__.upper()}_UPDATED", instance, before=before, after=serializer.data)
 
 
+class RoleProtectedTenantViewSet(TenantScopedModelViewSet):
+    allowed_roles: set[str] = set()
+    write_roles: set[str] | None = None
+
+    def initial(self, request, *args, **kwargs):
+        super().initial(request, *args, **kwargs)
+        if request.user.role not in self.allowed_roles:
+            raise PermissionDenied("Your role does not have permission for this resource")
+        if request.method not in {"GET", "HEAD", "OPTIONS"} and self.write_roles is not None and request.user.role not in self.write_roles:
+            raise PermissionDenied("Your role has read-only access to this resource")
+
+
 class AdminOnlyTenantUserViewSet(TenantScopedModelViewSet):
     queryset = User.objects.all()
     serializer_class = UserSerializer
@@ -141,9 +153,10 @@ def me_view(request):
     return Response(UserSerializer(request.user).data)
 
 
-class ProgramViewSet(TenantScopedModelViewSet):
+class ProgramViewSet(RoleProtectedTenantViewSet):
     queryset = Program.objects.all()
     serializer_class = ProgramSerializer
+    allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
 
     @action(detail=True, methods=["get", "post"], url_path="channels")
     def channels(self, request, pk=None):
@@ -157,30 +170,39 @@ class ProgramViewSet(TenantScopedModelViewSet):
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
-class HouseholdViewSet(TenantScopedModelViewSet):
+class HouseholdViewSet(RoleProtectedTenantViewSet):
     queryset = Household.objects.select_related("program")
     serializer_class = HouseholdSerializer
+    allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER}
 
 
-class BeneficiaryViewSet(TenantScopedModelViewSet):
+class BeneficiaryViewSet(RoleProtectedTenantViewSet):
     queryset = Beneficiary.objects.select_related("household", "household__tenant")
     serializer_class = BeneficiarySerializer
     tenant_field = "household__tenant"
+    allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER}
 
 
-class EnrollmentViewSet(TenantScopedModelViewSet):
+class EnrollmentViewSet(RoleProtectedTenantViewSet):
     queryset = Enrollment.objects.select_related("program", "beneficiary", "beneficiary__household")
     serializer_class = EnrollmentSerializer
     tenant_field = "program__tenant"
+    allowed_roles = {User.Role.ADMIN, User.Role.REVIEWER}
 
 
-class PaymentInstructionViewSet(TenantScopedModelViewSet):
+class PaymentInstructionViewSet(RoleProtectedTenantViewSet):
     queryset = PaymentInstruction.objects.select_related("enrollment", "beneficiary", "channel_config", "enrollment__program")
     serializer_class = PaymentInstructionSerializer
     tenant_field = "enrollment__program__tenant"
+    allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER, User.Role.AUDITOR}
+    write_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
 
     def perform_create(self, serializer):
-        instruction = serializer.save(created_by=self.request.user, status=PaymentInstruction.Status.CREATED)
+        instruction = serializer.save(
+            created_by=self.request.user,
+            status=PaymentInstruction.Status.CREATED,
+            idempotency_key=str(uuid.uuid4()),
+        )
         PaymentEvent.objects.create(
             instruction=instruction,
             event_type=PaymentEvent.EventType.CREATED,
@@ -229,21 +251,25 @@ class PaymentInstructionViewSet(TenantScopedModelViewSet):
         return Response(PaymentEventSerializer(self.get_object().events.all().order_by("created_at"), many=True).data)
 
 
-class ComplaintViewSet(TenantScopedModelViewSet):
+class ComplaintViewSet(RoleProtectedTenantViewSet):
     queryset = Complaint.objects.select_related("beneficiary", "beneficiary__household")
     serializer_class = ComplaintSerializer
     tenant_field = "beneficiary__household__tenant"
+    allowed_roles = {User.Role.ADMIN, User.Role.SUPPORT, User.Role.MANAGER}
 
 
-class BudgetViewSet(TenantScopedModelViewSet):
+class BudgetViewSet(RoleProtectedTenantViewSet):
     queryset = Budget.objects.select_related("program")
     serializer_class = BudgetSerializer
     tenant_field = "program__tenant"
+    allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
 
 
-class PaymentBatchViewSet(TenantScopedModelViewSet):
+class PaymentBatchViewSet(RoleProtectedTenantViewSet):
     queryset = PaymentBatch.objects.select_related("program")
     serializer_class = PaymentBatchSerializer
+    allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER, User.Role.AUDITOR}
+    write_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
 
 
 class AISignalViewSet(TenantScopedModelViewSet):
@@ -262,9 +288,11 @@ class AISignalViewSet(TenantScopedModelViewSet):
         return Response(AISignalSerializer(signal).data)
 
 
-class ReconciliationItemViewSet(TenantScopedModelViewSet):
+class ReconciliationItemViewSet(RoleProtectedTenantViewSet):
     queryset = ReconciliationItem.objects.select_related("program", "instruction")
     serializer_class = ReconciliationItemSerializer
+    allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER, User.Role.AUDITOR}
+    write_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
 
     @action(detail=True, methods=["post"])
     def resolve(self, request, pk=None):
@@ -278,9 +306,10 @@ class ReconciliationItemViewSet(TenantScopedModelViewSet):
         return Response(ReconciliationItemSerializer(item).data)
 
 
-class ReviewTaskViewSet(TenantScopedModelViewSet):
+class ReviewTaskViewSet(RoleProtectedTenantViewSet):
     queryset = ReviewTask.objects.select_related("program", "assigned_to")
     serializer_class = ReviewTaskSerializer
+    allowed_roles = {User.Role.ADMIN, User.Role.REVIEWER, User.Role.MANAGER, User.Role.SUPPORT}
 
     @action(detail=True, methods=["post"])
     def resolve(self, request, pk=None):
@@ -372,6 +401,8 @@ def program_summary_view(request, program_id):
 
 @api_view(["POST"])
 def imports_view(request):
+    if request.user.role not in {User.Role.ADMIN, User.Role.MANAGER}:
+        raise PermissionDenied("Only administrators and managers can import mapped records")
     return Response({
         "status": "accepted",
         "message": "Controlled CSV/XLSX import mapping endpoint placeholder. Processing service can be connected here.",
@@ -381,6 +412,8 @@ def imports_view(request):
 
 @api_view(["GET", "POST"])
 def pdm_view(request):
+    if request.user.role not in {User.Role.ADMIN, User.Role.SUPPORT, User.Role.FIELD_OFFICER, User.Role.MANAGER}:
+        raise PermissionDenied("Your role does not have permission for PDM")
     return Response({
         "status": "derived",
         "message": "PDM is exposed without a dedicated MVP table; payloads are handled through controlled API/audit flow.",
@@ -405,6 +438,8 @@ def pdm_summary_view(request):
 
 @api_view(["POST"])
 def registration_sync_view(request):
+    if request.user.role not in {User.Role.ADMIN, User.Role.FIELD_OFFICER}:
+        raise PermissionDenied("Only field officers and administrators can synchronize registrations")
     program_id = request.data.get("program_id")
     household_data = request.data.get("household", request.data)
     client_generated_id = household_data.get("client_generated_id")
