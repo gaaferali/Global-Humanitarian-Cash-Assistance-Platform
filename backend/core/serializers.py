@@ -134,12 +134,16 @@ class PaymentInstructionSerializer(serializers.ModelSerializer):
 
     def validate(self, attrs):
         enrollment = attrs["enrollment"]
+        beneficiary = attrs["beneficiary"]
+        channel_config = attrs["channel_config"]
         if enrollment.status != Enrollment.Status.APPROVED:
             raise serializers.ValidationError("Payment instruction requires an approved enrollment")
-        if attrs["beneficiary_id"] != enrollment.beneficiary_id:
+        if beneficiary.pk != enrollment.beneficiary.pk:
             raise serializers.ValidationError("Beneficiary must match enrollment")
-        if attrs["channel_config"].program_id != enrollment.program_id:
+        if channel_config.program.pk != enrollment.program.pk:
             raise serializers.ValidationError("Channel must belong to the enrollment program")
+        if enrollment.program.tenant.pk != self.context["request"].user.tenant.pk:
+            raise serializers.ValidationError("Enrollment belongs to another tenant")
         return attrs
 
 

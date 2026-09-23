@@ -1,6 +1,8 @@
 import uuid
+import json
 
 from django.contrib.auth import login
+from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
 from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
@@ -78,8 +80,8 @@ def audit(user, action, entity, before=None, after=None):
             action=action,
             entity_type=entity.__class__.__name__,
             entity_id=str(entity.pk),
-            before=before or {},
-            after=after or {},
+            before=json.loads(json.dumps(before or {}, cls=DjangoJSONEncoder)),
+            after=json.loads(json.dumps(after or {}, cls=DjangoJSONEncoder)),
             correlation_id=str(uuid.uuid4()),
         )
 
@@ -146,6 +148,12 @@ def login_view(request):
     login(request, user)
     token, _ = Token.objects.get_or_create(user=user)
     return Response({"user": UserSerializer(user).data, "token": token.key})
+
+
+@api_view(["POST"])
+def logout_view(request):
+    Token.objects.filter(user=request.user).delete()
+    return Response({"status": "signed_out"})
 
 
 @api_view(["GET"])
@@ -423,6 +431,8 @@ def pdm_view(request):
 
 @api_view(["GET"])
 def pdm_summary_view(request):
+    if request.user.role not in {User.Role.ADMIN, User.Role.SUPPORT, User.Role.FIELD_OFFICER, User.Role.MANAGER}:
+        raise PermissionDenied("Your role does not have permission for PDM summaries")
     return Response({
         "program": request.query_params.get("program"),
         "channel": request.query_params.get("channel"),

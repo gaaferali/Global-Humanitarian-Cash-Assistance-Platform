@@ -45,6 +45,7 @@ export const api = {
   users: () => request<PlatformUser[] | { results: PlatformUser[] }>("/users/"),
   createUser: (payload: Pick<PlatformUser, "email" | "full_name" | "role"> & { password: string }) =>
     request<PlatformUser>("/users/", { method: "POST", body: JSON.stringify(payload) }),
+  logout: () => request<{ status: string }>("/auth/logout/", { method: "POST" }),
   list: <T>(resource: string) => request<ApiList<T>>(`/${resource}/`),
   create: <T>(resource: string, payload: Record<string, unknown>) =>
     request<T>(`/${resource}/`, { method: "POST", body: JSON.stringify(payload) }),

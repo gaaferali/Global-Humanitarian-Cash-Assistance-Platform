@@ -17,6 +17,7 @@ from .views import (
     ai_closed_view,
     imports_view,
     login_view,
+    logout_view,
     me_view,
     pdm_summary_view,
     pdm_view,
@@ -42,6 +43,7 @@ router.register("review-tasks", ReviewTaskViewSet)
 urlpatterns = [
     path("", include(router.urls)),
     path("auth/login/", login_view),
+    path("auth/logout/", logout_view),
     path("me/", me_view),
     path("reports/", reports_view),
     path("reporting/programs/<uuid:program_id>/summary/", program_summary_view),
