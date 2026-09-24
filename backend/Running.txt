@@ -1,0 +1,13 @@
+افتح docker desktop واتاكد انو شغال
+تشغيل السيرفر "C:\Users\HP\Projects\Global-Humanitarian-Cash-Assistance-Platform\backend>python manage.py runserver"
+عشان تجيب التقرير : تفتح الPowershell 
+1- "C:\Users\HP\Projects\Global-Humanitarian-Cash-Assistance-Platform\backend>python manage.py shell"
+
+2- "انسخ الأوامر دي ونفذها جوه الـ Django Shell عندك:
+from core.services import AICopilotService
+
+# استدعاء الدالة الحقيقية للـ Copilot لتوليد التقرير التنفيذي
+report_output = AICopilotService.generate_system_summary_report()
+
+# عرض التقرير الناتج مباشرة
+print(report_output)"

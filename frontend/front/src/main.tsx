@@ -134,35 +134,8 @@ function ImportsPage() {
 }
 
 function Dashboard() { const [summary, setSummary] = useState<Record<string, number> | null>(null); useEffect(() => { api.get<{ dashboards: Record<string, number> }>("/reports/").then((result) => setSummary(result.dashboards)).catch(() => undefined); }, []); const values = summary ?? { beneficiaries: 0, approvals: 0, paid: 0, pending: 0, failed: 0 }; return <><section className="kpi-grid">{Object.entries(values).slice(0, 5).map(([label, value]) => <article className="kpi" key={label}><strong>{String(value)}</strong><span>{label.replaceAll("_", " ")}</span></article>)}</section><Panel title="Operational dashboard"><p>Dashboard figures are deterministic, tenant-scoped, and show only the data permitted to your role. Managers and auditors can inspect reconciliation, complaint, PDM, budget, and audit views.</p></Panel></>; }
-function Automation() {
-  const data = {
-    status: "disabled",
-    message: "Execution disabled. AI endpoints are not implemented yet.",
-    rules: [
-      { id: 1, event_type: "PAYMENT_FAILED", action_type: "Create exception review", is_active: false },
-      { id: 2, event_type: "DUPLICATE_FLAG", action_type: "Assign duplicate review", is_active: false },
-      { id: 3, event_type: "HIGH_SEVERITY_COMPLAINT", action_type: "Escalate to manager", is_active: false }
-    ],
-    signals_count: 0
-  };
-
-  return (
-    <Panel title="AI and automation foundation">
-      <div className="alert alert-secondary">
-        <strong>Execution disabled.</strong> {data.message}
-      </div>
-      <p className="mb-3"><strong>Total AI Signals:</strong> {data.signals_count}</p>
-      <Table 
-        headings={["Event", "Action Type", "Status"]} 
-        rows={data.rules.map((rule) => [
-          rule.event_type, 
-          rule.action_type, 
-          <Badge value={rule.is_active ? "ACTIVE" : "DISABLED"} />
-        ])} 
-      />
-    </Panel>
-  );
-}function UsersPage() { const [users, setUsers] = useState<PlatformUser[]>([]); const [status, setStatus] = useState(""); const [error, setError] = useState(""); const load = () => api.users().then((result) => setUsers(listItems(result))).catch((reason) => setError(reason instanceof Error ? reason.message : "Could not load users.")); useEffect(() => { void load(); }, []); const submit = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const target = event.currentTarget; const form = new FormData(target); setStatus("saving"); try { await api.createUser({ full_name: String(form.get("full_name")), email: String(form.get("email")), role: String(form.get("role")) as Role, password: String(form.get("password")) }); target.reset(); await load(); setStatus("saved"); } catch (reason) { setStatus("failed"); setError(reason instanceof Error ? reason.message : "Correct the user fields."); } }; return <div className="row g-3"><div className="col-lg-7"><Panel title="Tenant users"><Table headings={["Name", "Email", "Role", "Status"]} rows={users.map((user) => [user.full_name, user.email, user.role, <Badge value={user.is_active ? "ACTIVE" : "INACTIVE"} />])} /></Panel></div><div className="col-lg-5"><Panel title="Add user"><form onSubmit={submit}><Field label="Full name" name="full_name" required /><Field label="Work email" name="email" type="email" required /><Field label="Role" name="role" required options={["FIELD_OFFICER", "FINANCE", "REVIEWER", "SUPPORT", "MANAGER", "AUDITOR", "ADMIN"]} /><Field label="Temporary password" name="password" type="password" required /><button className="btn btn-primary">Create user</button></form><Message status={status} error={error} /></Panel></div></div>; }
+function Automation() { return <Panel title="AI and automation foundation"><div className="alert alert-secondary"><strong>Execution disabled.</strong> Data models for signals, reviews, rules, and execution tracking are prepared. AI cannot make eligibility, fraud, or payment decisions, and all AI endpoints remain closed until you implement them.</div><Table headings={["Event", "Human-controlled action", "Status"]} rows={[["PAYMENT_FAILED", "Create exception review", <Badge value="DISABLED" />], ["DUPLICATE_FLAG", "Assign duplicate review", <Badge value="DISABLED" />], ["HIGH_SEVERITY_COMPLAINT", "Escalate to manager", <Badge value="DISABLED" />]]} /></Panel>; }
+function UsersPage() { const [users, setUsers] = useState<PlatformUser[]>([]); const [status, setStatus] = useState(""); const [error, setError] = useState(""); const load = () => api.users().then((result) => setUsers(listItems(result))).catch((reason) => setError(reason instanceof Error ? reason.message : "Could not load users.")); useEffect(() => { void load(); }, []); const submit = async (event: FormEvent<HTMLFormElement>) => { event.preventDefault(); const target = event.currentTarget; const form = new FormData(target); setStatus("saving"); try { await api.createUser({ full_name: String(form.get("full_name")), email: String(form.get("email")), role: String(form.get("role")) as Role, password: String(form.get("password")) }); target.reset(); await load(); setStatus("saved"); } catch (reason) { setStatus("failed"); setError(reason instanceof Error ? reason.message : "Correct the user fields."); } }; return <div className="row g-3"><div className="col-lg-7"><Panel title="Tenant users"><Table headings={["Name", "Email", "Role", "Status"]} rows={users.map((user) => [user.full_name, user.email, user.role, <Badge value={user.is_active ? "ACTIVE" : "INACTIVE"} />])} /></Panel></div><div className="col-lg-5"><Panel title="Add user"><form onSubmit={submit}><Field label="Full name" name="full_name" required /><Field label="Work email" name="email" type="email" required /><Field label="Role" name="role" required options={["FIELD_OFFICER", "FINANCE", "REVIEWER", "SUPPORT", "MANAGER", "AUDITOR", "ADMIN"]} /><Field label="Temporary password" name="password" type="password" required /><button className="btn btn-primary">Create user</button></form><Message status={status} error={error} /></Panel></div></div>; }
 
 function App() {
   const [user, setUser] = useState<PlatformUser | null>(null); const [locale, setLocale] = useState<"en" | "ar">("en"); const [route, setRoute] = useState<Route>(routeFromHash); const t = translations[locale]; const role = user?.role as Role;

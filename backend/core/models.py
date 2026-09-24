@@ -6,6 +6,22 @@ from django.db import models
 from django.utils import timezone as django_timezone
 
 
+class AutomationRule(models.Model):
+    name = models.CharField(max_length=255)
+    is_active = models.BooleanField(default=True)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return self.name
+
+class ReconciliationItem(models.Model):
+    status = models.CharField(max_length=50, default="PENDING")
+    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    def __str__(self):
+        return f"Item {self.id} - {self.status}"
+
 class Tenant(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
