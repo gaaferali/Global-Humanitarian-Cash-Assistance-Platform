@@ -1,19 +1,19 @@
 import uuid
 import json
 
-from django.contrib.auth import login
 from django.core.serializers.json import DjangoJSONEncoder
 from django.db import transaction
 from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
-from rest_framework.authtoken.models import Token
 from rest_framework import status, viewsets
 from rest_framework.decorators import action, api_view, permission_classes
 from rest_framework.exceptions import PermissionDenied, ValidationError
 from rest_framework.permissions import AllowAny, IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import exception_handler
+from rest_framework_simplejwt.exceptions import TokenError
+from rest_framework_simplejwt.tokens import RefreshToken
 
 from .models import (
     AISignal,
@@ -145,14 +145,22 @@ def login_view(request):
     serializer = LoginSerializer(data=request.data)
     serializer.is_valid(raise_exception=True)
     user = serializer.validated_data["user"]
-    login(request, user)
-    token, _ = Token.objects.get_or_create(user=user)
-    return Response({"user": UserSerializer(user).data, "token": token.key})
+    refresh = RefreshToken.for_user(user)
+    return Response({
+        "user": UserSerializer(user).data,
+        "access": str(refresh.access_token),
+        "refresh": str(refresh),
+    })
 
 
 @api_view(["POST"])
 def logout_view(request):
-    Token.objects.filter(user=request.user).delete()
+    refresh_token = request.data.get("refresh")
+    if refresh_token:
+        try:
+            RefreshToken(refresh_token).blacklist()
+        except TokenError:
+            pass
     return Response({"status": "signed_out"})
 
 

@@ -141,6 +141,7 @@ function App() {
   const [user, setUser] = useState<PlatformUser | null>(null); const [locale, setLocale] = useState<"en" | "ar">("en"); const [route, setRoute] = useState<Route>(routeFromHash); const t = translations[locale]; const role = user?.role as Role;
   useInterfaceLanguage(locale);
   useEffect(() => { const update = () => setRoute(routeFromHash()); addEventListener("hashchange", update); if (localStorage.getItem("hcap_token")) api.me().then(setUser).catch(api.clearToken); return () => removeEventListener("hashchange", update); }, []);
+  useEffect(() => { if (role && !roleRoutes[route].includes(role)) location.hash = "#/dashboard"; }, [role, route]);
   const go = (target: Route) => { location.hash = `#/${routePaths[target]}`; };
   if (!user) return <Login onLogin={(staff) => { setUser(staff); go("dashboard"); }} />;
   const permittedNav = nav.filter(([item]) => roleRoutes[item].includes(role));
