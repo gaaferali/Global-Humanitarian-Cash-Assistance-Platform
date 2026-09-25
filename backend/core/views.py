@@ -66,6 +66,10 @@ from .serializers import (
     ReviewTaskSerializer,
     UserSerializer,
     TenantSerializer,
+    national_id_digest,
+    national_id_reference,
+    normalize_national_id,
+    normalize_phone_number,
 )
 
 
@@ -717,14 +721,17 @@ def imports_view(request):
         rows = [dict(zip(headers, row)) for row in values[1:] if any(value is not None and str(value).strip() for value in row)]
     else:
         raise ValidationError({"file": "Use a .csv or .xlsx file"})
-    required_columns = {"client_generated_id", "household_size", "location", "beneficiary_number", "full_name"}
-    missing_columns = sorted(required_columns - (set(rows[0].keys()) if rows else set()))
+    available_columns = set(rows[0].keys()) if rows else set()
+    required_columns = {"client_generated_id", "household_size", "location", "full_name"}
+    missing_columns = sorted(required_columns - available_columns)
+    if not ({"national_id", "beneficiary_number"} & available_columns):
+        missing_columns.append("national_id (or beneficiary_number)")
     if missing_columns:
         raise ValidationError({"file": f"Missing required columns: {', '.join(missing_columns)}"})
     errors, normalized_rows = [], []
     for row_number, row in enumerate(rows, start=2):
         client_id = str(row.get("client_generated_id") or "").strip()
-        number = str(row.get("beneficiary_number") or "").strip()
+        raw_national_id = str(row.get("national_id") or row.get("beneficiary_number") or "").strip()
         full_name = str(row.get("full_name") or "").strip()
         location = str(row.get("location") or "").strip()
         try:
@@ -734,14 +741,20 @@ def imports_view(request):
         except (TypeError, ValueError):
             errors.append({"row": row_number, "field": "household_size", "message": "Use a positive whole number"})
             continue
-        if not client_id or not number or not full_name or not location:
-            errors.append({"row": row_number, "field": "required", "message": "client_generated_id, location, beneficiary_number, and full_name are required"})
+        if not client_id or not raw_national_id or not full_name or not location:
+            errors.append({"row": row_number, "field": "required", "message": "client_generated_id, location, national_id (or beneficiary_number), and full_name are required"})
+            continue
+        try:
+            normalized_national_id = normalize_national_id(raw_national_id)
+            phone_number = normalize_phone_number(row.get("phone_number") or row.get("phone_last4"))
+        except ValidationError as exc:
+            errors.append({"row": row_number, "field": "beneficiary", "message": str(exc.detail[0])})
             continue
         verification_status = str(row.get("verification_status") or Beneficiary.VerificationStatus.PENDING).upper()
         if verification_status not in Beneficiary.VerificationStatus.values:
             errors.append({"row": row_number, "field": "verification_status", "message": "Use PENDING, VERIFIED, or REJECTED"})
             continue
-        normalized_rows.append({"client_id": client_id, "size": household_size, "location": location, "registration_date": str(row.get("registration_date") or timezone.localdate()), "number": number, "full_name": full_name, "gender": str(row.get("gender") or "").strip(), "phone_last4": str(row.get("phone_last4") or "").strip()[-4:], "national_id_hash": str(row.get("national_id_hash") or "").strip(), "consent_given": str(row.get("consent_given") or "").lower() in {"1", "true", "yes", "y"}, "verification_status": verification_status})
+        normalized_rows.append({"client_id": client_id, "size": household_size, "location": location, "registration_date": str(row.get("registration_date") or timezone.localdate()), "number": national_id_reference(normalized_national_id), "full_name": full_name, "gender": str(row.get("gender") or "").strip(), "phone_number": phone_number, "phone_last4": phone_number[-4:] if phone_number else "", "national_id_hash": str(row.get("national_id_hash") or national_id_digest(normalized_national_id)).strip(), "consent_given": str(row.get("consent_given") or "").lower() in {"1", "true", "yes", "y"}, "verification_status": verification_status})
     duplicate_candidates = 0
     for row in normalized_rows:
         matches = Beneficiary.objects.filter(household__tenant=tenant, household__program=program)
@@ -779,7 +792,7 @@ def imports_view(request):
             household, created = Household.objects.get_or_create(tenant=tenant, client_generated_id=row["client_id"], defaults={"program": program, "household_size": row["size"], "location": row["location"], "registration_date": row["registration_date"], "created_by": request.user})
             if household.program_id != program.id:
                 raise ValidationError({"client_generated_id": f"{row['client_id']} belongs to another program"})
-            beneficiary, beneficiary_created = Beneficiary.objects.update_or_create(household=household, number=row["number"], defaults={"full_name": row["full_name"], "gender": row["gender"], "phone_last4": row["phone_last4"], "national_id_hash": row["national_id_hash"], "consent_given": row["consent_given"], "verification_status": row["verification_status"], "created_by": request.user})
+            beneficiary, beneficiary_created = Beneficiary.objects.update_or_create(household=household, number=row["number"], defaults={"full_name": row["full_name"], "gender": row["gender"], "phone_number": row["phone_number"], "phone_last4": row["phone_last4"], "national_id_hash": row["national_id_hash"], "consent_given": row["consent_given"], "verification_status": row["verification_status"], "created_by": request.user})
             households_created += int(created)
             beneficiaries_created += int(beneficiary_created)
             duplicate_flags += int(run_deduplication_check(beneficiary)["matches"] > 0)
@@ -809,6 +822,8 @@ def pdm_view(request):
             responses = responses.filter(tenant=requested_tenant)
         if request.query_params.get("program"):
             program = scoped_program(request, request.query_params["program"])
+            if requested_tenant and str(program.tenant_id) != str(requested_tenant):
+                raise PermissionDenied("The selected program does not belong to the selected tenant")
             responses = responses.filter(program=program)
         return Response(list(responses.values("id", "tenant", "tenant__name", "program", "program__name", "channel", "location", "received_rate", "amount_received", "access_problem_rate", "complaint_rate", "satisfaction", "created_at")))
     if request.user.role == User.Role.AUDITOR:
@@ -852,18 +867,19 @@ def pdm_summary_view(request):
                 responses = responses.filter(**{field: request.query_params[field]})
     totals = responses.aggregate(received_rate=Sum("received_rate"), amount_received=Sum("amount_received"), access_problem_rate=Sum("access_problem_rate"), complaint_rate=Sum("complaint_rate"), satisfaction=Sum("satisfaction"), count=Count("id"))
     count = totals["count"] or 0
+    channels = list(responses.exclude(channel="").values_list("channel", flat=True).distinct().order_by("channel"))
+    locations = list(responses.exclude(location="").values_list("location", flat=True).distinct().order_by("location"))
     return Response({
         "program": {"id": str(selected_program.id), "name": selected_program.name} if selected_program else None,
         "tenant": {"id": str(selected_tenant.id), "name": selected_tenant.name} if selected_tenant else None,
-        "channel": request.query_params.get("channel"),
-        "location": request.query_params.get("location"),
+        "channels": channels,
+        "locations": locations,
         "received_rate": float(totals["received_rate"] / count) if count else 0,
         "amount_received": str(totals["amount_received"] or 0),
         "access_problem_rate": float(totals["access_problem_rate"] / count) if count else 0,
         "complaint_rate": float(totals["complaint_rate"] / count) if count else 0,
         "satisfaction": float(totals["satisfaction"] / count) if count else 0,
         "responses": count,
-        "source": "pdm_response_storage",
     })
 
 
@@ -894,17 +910,21 @@ def registration_sync_view(request):
 
     beneficiaries_created = 0
     for beneficiary_data in request.data.get("beneficiaries", []):
-        number = beneficiary_data.get("number")
+        raw_national_id = beneficiary_data.get("national_id") or beneficiary_data.get("number")
         full_name = beneficiary_data.get("full_name")
-        if not number or not full_name:
-            raise ValidationError({"beneficiaries": "Each beneficiary requires number and full_name"})
+        if not raw_national_id or not full_name:
+            raise ValidationError({"beneficiaries": "Each beneficiary requires national_id and full_name"})
+        normalized_national_id = normalize_national_id(raw_national_id)
+        phone_number = normalize_phone_number(beneficiary_data.get("phone_number") or beneficiary_data.get("phone_last4"))
         _, created = Beneficiary.objects.get_or_create(
             household=household,
-            number=number,
+            number=national_id_reference(normalized_national_id),
             defaults={
                 "full_name": full_name,
                 "gender": beneficiary_data.get("gender", ""),
-                "phone_last4": beneficiary_data.get("phone_last4", ""),
+                "phone_number": phone_number,
+                "phone_last4": phone_number[-4:] if phone_number else "",
+                "national_id_hash": national_id_digest(normalized_national_id),
                 "consent_given": beneficiary_data.get("consent_given", False),
                 "created_by": request.user,
             },

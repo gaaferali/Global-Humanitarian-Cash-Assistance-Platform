@@ -77,6 +77,60 @@ class DuplicateEndpointTests(TestCase):
         self.assertIn("valid beneficiary", response.data["error"]["message"])
 
 
+class RegistrationTests(TestCase):
+    def setUp(self):
+        self.tenant = Tenant.objects.create(name="Tenant A", tenant_type="NGO", default_currency="USD")
+        self.other_tenant = Tenant.objects.create(name="Tenant B", tenant_type="NGO", default_currency="USD")
+        self.field_officer = User.objects.create_user("field@example.test", "Field Officer", self.tenant, "password", role=User.Role.FIELD_OFFICER)
+        self.tenant_admin = User.objects.create_user("admin@example.test", "Tenant Admin", self.tenant, "password", role=User.Role.ADMIN)
+        self.support = User.objects.create_user("support@example.test", "Support Officer", self.tenant, "password", role=User.Role.SUPPORT)
+        self.manager = User.objects.create_user("manager@example.test", "Tenant Manager", self.tenant, "password", role=User.Role.MANAGER)
+        self.program = Program.objects.create(tenant=self.tenant, name="Cash support", country="Sudan", country_code="SD", currency="USD", reporting_currency="USD", transfer_amount="50.00", payment_cycle=Program.Cycle.MONTHLY, created_by=self.manager)
+        self.other_program = Program.objects.create(tenant=self.other_tenant, name="Other support", country="Chad", country_code="TD", currency="USD", reporting_currency="USD", transfer_amount="50.00", payment_cycle=Program.Cycle.MONTHLY, created_by=User.objects.create_user("other-manager@example.test", "Other Manager", self.other_tenant, "password", role=User.Role.MANAGER))
+        self.client = APIClient()
+
+    def create_household(self, user):
+        self.client.force_authenticate(user)
+        return self.client.post("/api/households/", {"program": str(self.program.id), "household_size": 4, "location": "Khartoum", "registration_date": "2026-09-25"}, format="json")
+
+    def test_field_officer_creates_household_without_client_generated_id(self):
+        response = self.create_household(self.field_officer)
+        self.assertEqual(response.status_code, 201)
+        household = Household.objects.get(id=response.data["id"])
+        self.assertEqual(household.client_generated_id, "")
+        self.assertEqual(household.tenant, self.tenant)
+        self.assertEqual(household.created_by, self.field_officer)
+        self.assertTrue(response.data["registration_reference"].startswith("HH-"))
+
+    def test_tenant_admin_creates_household_without_client_generated_id(self):
+        response = self.create_household(self.tenant_admin)
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(Household.objects.get(id=response.data["id"]).created_by, self.tenant_admin)
+
+    def test_unauthorized_role_cannot_create_household(self):
+        response = self.create_household(self.support)
+        self.assertEqual(response.status_code, 403)
+
+    def test_beneficiary_saves_full_phone_and_hides_raw_national_id(self):
+        household_response = self.create_household(self.field_officer)
+        response = self.client.post("/api/beneficiaries/", {"household": household_response.data["id"], "national_id": "AB-123 456", "full_name": "Amina Ahmed", "phone_number": "+249 91 234-5678", "consent_given": True}, format="json")
+        self.assertEqual(response.status_code, 201)
+        beneficiary = Beneficiary.objects.get(id=response.data["id"])
+        self.assertEqual(beneficiary.phone_number, "+249912345678")
+        self.assertEqual(beneficiary.phone_last4, "5678")
+        self.assertTrue(beneficiary.national_id_hash)
+        self.assertNotEqual(beneficiary.number, "AB-123 456")
+        self.assertNotIn("number", response.data)
+        self.assertNotIn("national_id", response.data)
+        self.assertNotIn("AB-123 456", str(response.data))
+
+    def test_cross_tenant_household_cannot_receive_beneficiary(self):
+        other_household = Household.objects.create(tenant=self.other_tenant, program=self.other_program, household_size=2, location="N'Djamena", registration_date=date(2026, 9, 25), created_by=self.other_program.created_by)
+        self.client.force_authenticate(self.field_officer)
+        response = self.client.post("/api/beneficiaries/", {"household": str(other_household.id), "national_id": "TD-12345", "full_name": "Other Person"}, format="json")
+        self.assertEqual(response.status_code, 400)
+
+
 class PlatformAdministrationTests(TestCase):
     def setUp(self):
         self.system_tenant = Tenant.objects.create(name="System", tenant_type="SYSTEM", default_currency="USD")
@@ -251,6 +305,86 @@ class PDMAndAuthenticationTests(TestCase):
         response = self.client.get(f"/api/pdm/summary/?tenant={self.other_tenant.id}")
         self.assertEqual(response.status_code, 403)
 
+    def test_manager_can_submit_and_view_only_own_tenant_pdm(self):
+        other_manager = User.objects.create_user("other-manager@example.test", "Other Tenant Manager", self.other_tenant, "password", role=User.Role.MANAGER)
+        other_program = Program.objects.create(
+            tenant=self.other_tenant,
+            name="Other cash support",
+            country="Kenya",
+            country_code="KE",
+            currency="KES",
+            reporting_currency="KES",
+            transfer_amount="50.00",
+            payment_cycle=Program.Cycle.MONTHLY,
+            created_by=other_manager,
+        )
+        PDMResponse.objects.create(
+            tenant=self.tenant,
+            program=self.program,
+            channel="MOBILE_MONEY",
+            location="North",
+            received_rate="90.00",
+            amount_received="45.00",
+            created_by=self.manager,
+        )
+        PDMResponse.objects.create(
+            tenant=self.other_tenant,
+            program=other_program,
+            channel="BANK",
+            location="South",
+            received_rate="80.00",
+            amount_received="40.00",
+            created_by=other_manager,
+        )
+        self.client.force_authenticate(self.manager)
+        records = self.client.get("/api/pdm/")
+        self.assertEqual(records.status_code, 200)
+        self.assertEqual(len(records.data), 1)
+        self.assertEqual(str(records.data[0]["tenant"]), str(self.tenant.id))
+        summary = self.client.get(f"/api/pdm/summary/?program={self.program.id}")
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.data["responses"], 1)
+        self.assertEqual(summary.data["channels"], ["MOBILE_MONEY"])
+        cross_tenant = self.client.get(f"/api/pdm/summary/?program={other_program.id}")
+        self.assertIn(cross_tenant.status_code, {403, 404})
+        cross_tenant_query = self.client.get(f"/api/pdm/?tenant={self.other_tenant.id}")
+        self.assertEqual(cross_tenant_query.status_code, 403)
+
+    def test_platform_admin_can_view_global_and_selected_tenant_pdm(self):
+        PDMResponse.objects.create(
+            tenant=self.tenant,
+            program=self.program,
+            channel="MOBILE_MONEY",
+            location="North",
+            received_rate="90.00",
+            amount_received="45.00",
+            created_by=self.manager,
+        )
+        platform_admin = User.objects.create_superuser("platform@example.test", "Platform Administrator", "password")
+        self.client.force_authenticate(platform_admin)
+        global_summary = self.client.get("/api/pdm/summary/")
+        self.assertEqual(global_summary.status_code, 200)
+        self.assertEqual(global_summary.data["responses"], 1)
+        tenant_summary = self.client.get(f"/api/pdm/summary/?tenant={self.tenant.id}")
+        self.assertEqual(tenant_summary.status_code, 200)
+        self.assertEqual(tenant_summary.data["tenant"]["id"], str(self.tenant.id))
+        program_summary = self.client.get(f"/api/pdm/summary/?tenant={self.tenant.id}&program={self.program.id}")
+        self.assertEqual(program_summary.status_code, 200)
+        self.assertEqual(program_summary.data["program"]["id"], str(self.program.id))
+        mismatched_program = Program.objects.create(
+            tenant=platform_admin.tenant,
+            name="System program",
+            country="Sudan",
+            country_code="SD",
+            currency="USD",
+            reporting_currency="USD",
+            transfer_amount="10.00",
+            payment_cycle=Program.Cycle.ONE_TIME,
+            created_by=platform_admin,
+        )
+        mismatch = self.client.get(f"/api/pdm/?tenant={self.tenant.id}&program={mismatched_program.id}")
+        self.assertEqual(mismatch.status_code, 403)
+
 
 class EndToEndWorkflowTests(TestCase):
     def setUp(self):
@@ -320,7 +454,7 @@ class EndToEndWorkflowTests(TestCase):
         self.assertEqual(household_response.status_code, 201)
         beneficiary_response = self.client.post(
             "/api/beneficiaries/",
-            {"household": household_response.data["id"], "number": "BEN-001", "full_name": "Amina Ahmed", "gender": "F", "phone_last4": "1234", "consent_given": True},
+            {"household": household_response.data["id"], "national_id": "BEN-001", "full_name": "Amina Ahmed", "gender": "F", "phone_number": "+249 91 234 1234", "consent_given": True},
             format="json",
         )
         self.assertEqual(beneficiary_response.status_code, 201)
@@ -334,7 +468,7 @@ class EndToEndWorkflowTests(TestCase):
         self.assertEqual(duplicate_household_response.status_code, 201)
         duplicate_beneficiary_response = self.client.post(
             "/api/beneficiaries/",
-            {"household": duplicate_household_response.data["id"], "number": "BEN-002", "full_name": "Amina Ahmed", "gender": "F", "phone_last4": "1234", "consent_given": True},
+            {"household": duplicate_household_response.data["id"], "national_id": "BEN-002", "full_name": "Amina Ahmed", "gender": "F", "phone_number": "+249 91 234 1234", "consent_given": True},
             format="json",
         )
         self.assertEqual(duplicate_beneficiary_response.status_code, 201)

@@ -63,7 +63,10 @@ export const api = {
   users: () => request<PlatformUser[] | { results: PlatformUser[] }>("/users/"),
   createUser: (payload: Pick<PlatformUser, "email" | "full_name" | "role"> & { password: string; tenant_id?: string }) =>
     request<PlatformUser>("/users/", { method: "POST", body: JSON.stringify(payload) }),
-  logout: () => request<{ status: string }>("/auth/logout/", { method: "POST" }),
+  logout: () => request<{ status: string }>("/auth/logout/", {
+    method: "POST",
+    body: JSON.stringify({ refresh: localStorage.getItem("hcap_refresh_token") }),
+  }),
   list: <T>(resource: string) => request<ApiList<T>>(`/${resource}/`),
   create: <T>(resource: string, payload: Record<string, unknown>) =>
     request<T>(`/${resource}/`, { method: "POST", body: JSON.stringify(payload) }),

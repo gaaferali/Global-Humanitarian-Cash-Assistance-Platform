@@ -1,6 +1,8 @@
 from django.contrib.auth import authenticate
 from django.utils import timezone
+from django.utils.crypto import salted_hmac
 from rest_framework import serializers
+import re
 
 from .models import (
     AISignal,
@@ -24,6 +26,32 @@ from .models import (
     Tenant,
     User,
 )
+
+
+def normalize_phone_number(value):
+    normalized = re.sub(r"[\s-]+", "", str(value or "").strip())
+    if not normalized:
+        return ""
+    if not re.fullmatch(r"\+?[0-9]{6,29}", normalized):
+        raise serializers.ValidationError("Use a valid international phone number with digits, spaces, hyphens, and an optional leading +.")
+    return normalized
+
+
+def normalize_national_id(value):
+    normalized = re.sub(r"[\s-]+", "", str(value or "").strip()).upper()
+    if not normalized:
+        raise serializers.ValidationError("National ID is required.")
+    if not re.fullmatch(r"[A-Z0-9]{3,80}", normalized):
+        raise serializers.ValidationError("National ID must contain letters or numbers and may include spaces or hyphens.")
+    return normalized
+
+
+def national_id_digest(national_id):
+    return salted_hmac("hcap.beneficiary.national-id", national_id).hexdigest()
+
+
+def national_id_reference(national_id):
+    return f"NID-{national_id_digest(national_id).upper()}"
 
 
 class TenantSerializer(serializers.ModelSerializer):
@@ -138,7 +166,7 @@ class HouseholdSerializer(serializers.ModelSerializer):
     class Meta:
         model = Household
         fields = "__all__"
-        read_only_fields = ["tenant", "created_by", "created_at"]
+        read_only_fields = ["tenant", "created_by", "created_at", "client_generated_id"]
 
     def validate_program(self, program):
         if program.tenant_id != self.context["request"].user.tenant_id:
@@ -150,8 +178,13 @@ class HouseholdSerializer(serializers.ModelSerializer):
 
 
 class BeneficiarySerializer(serializers.ModelSerializer):
+    number = serializers.CharField(write_only=True, required=False)
+    national_id = serializers.CharField(write_only=True, required=False)
+    national_id_hash = serializers.CharField(write_only=True, required=False)
+    phone_last4 = serializers.CharField(write_only=True, required=False)
     household_reference = serializers.SerializerMethodField()
     program_name = serializers.CharField(source="household.program.name", read_only=True)
+    national_id_reference = serializers.SerializerMethodField()
     masked_phone = serializers.SerializerMethodField()
 
     class Meta:
@@ -169,25 +202,45 @@ class BeneficiarySerializer(serializers.ModelSerializer):
         protected_fields = {"verification_status", "status"}
         if request.user.role == User.Role.FIELD_OFFICER and protected_fields.intersection(attrs):
             raise serializers.ValidationError("Field officers cannot set verification or workflow status.")
+        attrs.pop("national_id_hash", None)
+        attrs.pop("phone_last4", None)
+        submitted_national_id = attrs.pop("national_id", None) or attrs.get("number")
+        if submitted_national_id:
+            normalized_national_id = normalize_national_id(submitted_national_id)
+            attrs["number"] = national_id_reference(normalized_national_id)
+            attrs["national_id_hash"] = national_id_digest(normalized_national_id)
+        elif not self.instance:
+            raise serializers.ValidationError({"national_id": "National ID is required."})
+        if "phone_number" in attrs:
+            normalized_phone = normalize_phone_number(attrs["phone_number"])
+            attrs["phone_number"] = normalized_phone
+            attrs["phone_last4"] = normalized_phone[-4:] if normalized_phone else ""
         return attrs
 
     def get_household_reference(self, beneficiary):
         household = beneficiary.household
         return household.client_generated_id or f"HH-{str(household.id).split('-')[0].upper()}"
 
+    def get_national_id_reference(self, beneficiary):
+        return f"•••• {beneficiary.number[-4:]}" if beneficiary.number else "Not recorded"
+
     def get_masked_phone(self, beneficiary):
-        return f"•••• {beneficiary.phone_last4}" if beneficiary.phone_last4 else "Not recorded"
+        phone_number = beneficiary.phone_number or beneficiary.phone_last4
+        return f"•••• {phone_number[-4:]}" if phone_number else "Not recorded"
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):
     beneficiary_name = serializers.CharField(source="beneficiary.full_name", read_only=True)
-    beneficiary_number = serializers.CharField(source="beneficiary.number", read_only=True)
+    beneficiary_number = serializers.SerializerMethodField()
     program_name = serializers.CharField(source="program.name", read_only=True)
 
     class Meta:
         model = Enrollment
         fields = "__all__"
         read_only_fields = ["approved_by", "approved_at", "enrolled_at"]
+
+    def get_beneficiary_number(self, enrollment):
+        return f"•••• {enrollment.beneficiary.number[-4:]}" if enrollment.beneficiary.number else "Not recorded"
 
     def validate(self, attrs):
         beneficiary = attrs.get("beneficiary") or self.instance.beneficiary

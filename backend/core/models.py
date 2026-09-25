@@ -137,6 +137,7 @@ class Beneficiary(models.Model):
     full_name = models.CharField(max_length=255)
     gender = models.CharField(max_length=40, blank=True)
     date_of_birth = models.DateField(null=True, blank=True)
+    phone_number = models.CharField(max_length=30, blank=True)
     phone_last4 = models.CharField(max_length=4, blank=True)
     national_id_hash = models.CharField(max_length=255, blank=True)
     consent_given = models.BooleanField(default=False)
