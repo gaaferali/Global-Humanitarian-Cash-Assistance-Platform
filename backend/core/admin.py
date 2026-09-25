@@ -5,6 +5,7 @@ from .models import (
     AuditEvent,
     AutomationExecution,
     AutomationRule,
+    ActivityDependency,
     Beneficiary,
     Budget,
     Complaint,
@@ -14,7 +15,9 @@ from .models import (
     PaymentEvent,
     PaymentInstruction,
     PaymentBatch,
+    PDMResponse,
     Program,
+    ProgramActivity,
     ReconciliationItem,
     ReviewTask,
     Tenant,
@@ -24,6 +27,8 @@ from .models import (
 admin.site.register(Tenant)
 admin.site.register(User)
 admin.site.register(Program)
+admin.site.register(ProgramActivity)
+admin.site.register(ActivityDependency)
 admin.site.register(Household)
 admin.site.register(Beneficiary)
 admin.site.register(Enrollment)
@@ -39,3 +44,4 @@ admin.site.register(ReconciliationItem)
 admin.site.register(ReviewTask)
 admin.site.register(AutomationRule)
 admin.site.register(AutomationExecution)
+admin.site.register(PDMResponse)
