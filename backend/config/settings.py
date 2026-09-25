@@ -1,4 +1,6 @@
 import os
+
+from django.core.exceptions import ImproperlyConfigured
 from pathlib import Path
 
 from dotenv import load_dotenv
@@ -11,8 +13,14 @@ def env_bool(name, default=False):
     return os.getenv(name, str(default)).lower() in {"1", "true", "yes", "on"}
 
 
-SECRET_KEY = os.getenv("DJANGO_SECRET_KEY", "dev-only-change-me")
 DEBUG = env_bool("DJANGO_DEBUG", True)
+_configured_secret_key = os.getenv("DJANGO_SECRET_KEY", "")
+if len(_configured_secret_key) >= 32:
+    SECRET_KEY = _configured_secret_key
+elif DEBUG:
+    SECRET_KEY = "dev-only-change-me-use-a-unique-32-character-secret"
+else:
+    raise ImproperlyConfigured("DJANGO_SECRET_KEY must contain at least 32 characters when DEBUG is disabled")
 ALLOWED_HOSTS = [host.strip() for host in os.getenv("DJANGO_ALLOWED_HOSTS", "localhost,127.0.0.1").split(",") if host.strip()]
 CORS_ALLOWED_ORIGINS = [
     origin.strip()
@@ -72,7 +80,7 @@ DATABASES = {
         "USER": os.getenv("POSTGRES_USER", "hcap"),
         "PASSWORD": os.getenv("POSTGRES_PASSWORD", "hcap"),
         "HOST": os.getenv("POSTGRES_HOST", "localhost"),
-        "PORT": os.getenv("POSTGRES_PORT", "5432"),
+        "PORT": os.getenv("POSTGRES_PORT", "5433"),
     }
 }
 

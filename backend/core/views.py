@@ -103,8 +103,8 @@ def api_exception_handler(exc, context):
     return response
 
 
-def audit(user, action, entity, before=None, after=None):
-    tenant = getattr(user, "tenant", None)
+def audit(user, action, entity, before=None, after=None, tenant=None):
+    tenant = tenant or getattr(user, "tenant", None)
     if tenant:
         AuditEvent.objects.create(
             tenant=tenant,
@@ -116,6 +116,11 @@ def audit(user, action, entity, before=None, after=None):
             after=json.loads(json.dumps(after or {}, cls=DjangoJSONEncoder)),
             correlation_id=str(uuid.uuid4()),
         )
+
+
+def scoped_program(request, program_id):
+    programs = Program.objects.all() if request.user.is_superuser else Program.objects.filter(tenant=request.user.tenant)
+    return get_object_or_404(programs, id=program_id)
 
 
 class TenantScopedModelViewSet(viewsets.ModelViewSet):
@@ -165,8 +170,8 @@ class AdminOnlyTenantUserViewSet(TenantScopedModelViewSet):
 
     def initial(self, request, *args, **kwargs):
         super().initial(request, *args, **kwargs)
-        if self.request.user.role != User.Role.MANAGER and not self.request.user.is_superuser:
-            raise PermissionDenied("Only tenant managers can manage users")
+        if self.request.user.role not in {User.Role.ADMIN, User.Role.MANAGER} and not self.request.user.is_superuser:
+            raise PermissionDenied("Only tenant administrators and managers can manage users")
 
     def get_queryset(self):
         if self.request.user.is_superuser:
@@ -174,22 +179,34 @@ class AdminOnlyTenantUserViewSet(TenantScopedModelViewSet):
         return User.objects.filter(tenant=self.request.user.tenant)
 
     def perform_create(self, serializer):
-        if not self.request.user.is_superuser and serializer.validated_data.get("role") == User.Role.ADMIN:
-            raise ValidationError({"role": "Tenant managers cannot create platform administrators"})
+        if not self.request.user.is_superuser and serializer.validated_data.get("role") not in {
+            User.Role.FIELD_OFFICER,
+            User.Role.FINANCE,
+            User.Role.REVIEWER,
+            User.Role.SUPPORT,
+            User.Role.AUDITOR,
+        }:
+            raise ValidationError({"role": "Tenant administrators may assign only tenant operational roles"})
         tenant = serializer.validated_data.get("tenant", self.request.user.tenant) if self.request.user.is_superuser else self.request.user.tenant
         user = serializer.save(tenant=tenant)
-        audit(self.request.user, "USER_CREATED", user, after=UserSerializer(user).data)
+        audit(self.request.user, "USER_CREATED", user, after=UserSerializer(user).data, tenant=user.tenant)
 
     def perform_update(self, serializer):
         target = self.get_object()
         changes = serializer.validated_data
         if not self.request.user.is_superuser:
             if target.tenant_id != self.request.user.tenant_id or "tenant" in changes:
-                raise PermissionDenied("Tenant managers can only manage users in their own tenant")
-            if changes.get("role") == User.Role.ADMIN:
-                raise ValidationError({"role": "Tenant managers cannot assign the platform administrator role"})
+                raise PermissionDenied("Tenant administrators can only manage users in their own tenant")
+            if "role" in changes and changes["role"] not in {
+                User.Role.FIELD_OFFICER,
+                User.Role.FINANCE,
+                User.Role.REVIEWER,
+                User.Role.SUPPORT,
+                User.Role.AUDITOR,
+            }:
+                raise ValidationError({"role": "Tenant administrators may assign only tenant operational roles"})
             if target.pk == self.request.user.pk and ("role" in changes or "is_active" in changes):
-                raise PermissionDenied("Tenant managers cannot change their own role or access status")
+                raise PermissionDenied("Tenant administrators cannot change their own role or access status")
         before = UserSerializer(target).data
         user = serializer.save()
         audit(self.request.user, "USER_UPDATED", user, before=before, after=UserSerializer(user).data)
@@ -206,6 +223,15 @@ class SystemTenantViewSet(viewsets.ModelViewSet):
 
     def destroy(self, request, *args, **kwargs):
         raise PermissionDenied("Tenant deletion is disabled to preserve auditability")
+
+    def perform_create(self, serializer):
+        tenant = serializer.save()
+        audit(self.request.user, "TENANT_CREATED", tenant, after=TenantSerializer(tenant).data, tenant=tenant)
+
+    def perform_update(self, serializer):
+        before = TenantSerializer(serializer.instance).data
+        tenant = serializer.save()
+        audit(self.request.user, "TENANT_UPDATED", tenant, before=before, after=TenantSerializer(tenant).data, tenant=tenant)
 
 
 @api_view(["POST"])
@@ -237,7 +263,31 @@ def me_view(request):
 class ProgramViewSet(RoleProtectedTenantViewSet):
     queryset = Program.objects.all()
     serializer_class = ProgramSerializer
-    allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
+    allowed_roles = {
+        User.Role.ADMIN,
+        User.Role.FINANCE,
+        User.Role.MANAGER,
+        User.Role.FIELD_OFFICER,
+        User.Role.REVIEWER,
+        User.Role.SUPPORT,
+        User.Role.AUDITOR,
+    }
+    write_roles = {User.Role.ADMIN, User.Role.MANAGER}
+
+    def initial(self, request, *args, **kwargs):
+        TenantScopedModelViewSet.initial(self, request, *args, **kwargs)
+        if request.user.role not in self.allowed_roles:
+            raise PermissionDenied("Your role does not have permission for this resource")
+        if request.method in {"GET", "HEAD", "OPTIONS"}:
+            return
+        if self.action == "channels" and request.user.role in {
+            User.Role.ADMIN,
+            User.Role.MANAGER,
+            User.Role.FINANCE,
+        }:
+            return
+        if request.user.role not in self.write_roles:
+            raise PermissionDenied("Your role has read-only access to this resource")
 
     @action(detail=True, methods=["get", "post"], url_path="channels")
     def channels(self, request, pk=None):
@@ -247,7 +297,7 @@ class ProgramViewSet(RoleProtectedTenantViewSet):
         serializer = PaymentChannelConfigSerializer(data={**request.data, "program": str(program.id)})
         serializer.is_valid(raise_exception=True)
         channel = serializer.save()
-        audit(request.user, "PAYMENT_CHANNEL_CONFIG_CREATED", channel, after=serializer.data)
+        audit(request.user, "PAYMENT_CHANNEL_CONFIG_CREATED", channel, after=serializer.data, tenant=program.tenant)
         return Response(serializer.data, status=status.HTTP_201_CREATED)
 
 
@@ -264,6 +314,13 @@ class ProgramActivityViewSet(RoleProtectedTenantViewSet):
             return queryset.filter(owner=self.request.user)
         return queryset
 
+    def perform_create(self, serializer):
+        program = serializer.validated_data["program"]
+        if not self.request.user.is_superuser and program.tenant_id != self.request.user.tenant_id:
+            raise ValidationError({"program": "Program belongs to another tenant"})
+        instance = serializer.save(tenant=program.tenant, created_by=self.request.user)
+        audit(self.request.user, "PROGRAM_ACTIVITY_CREATED", instance, after=ProgramActivitySerializer(instance).data, tenant=program.tenant)
+
 
 class ActivityDependencyViewSet(RoleProtectedTenantViewSet):
     queryset = ActivityDependency.objects.select_related("predecessor", "successor")
@@ -278,27 +335,30 @@ class ActivityDependencyViewSet(RoleProtectedTenantViewSet):
 
     def perform_create(self, serializer):
         instance = serializer.save(created_by=self.request.user)
-        audit(self.request.user, "ACTIVITY_DEPENDENCY_CREATED", instance, after=serializer.data)
+        audit(self.request.user, "ACTIVITY_DEPENDENCY_CREATED", instance, after=serializer.data, tenant=instance.predecessor.tenant)
 
 
 class HouseholdViewSet(RoleProtectedTenantViewSet):
     queryset = Household.objects.select_related("program")
     serializer_class = HouseholdSerializer
-    allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER}
+    allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER}
+    write_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER}
 
 
 class BeneficiaryViewSet(RoleProtectedTenantViewSet):
     queryset = Beneficiary.objects.select_related("household", "household__tenant")
     serializer_class = BeneficiarySerializer
     tenant_field = "household__tenant"
-    allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER}
+    allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER, User.Role.SUPPORT, User.Role.MANAGER, User.Role.AUDITOR}
+    write_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER}
 
 
 class EnrollmentViewSet(RoleProtectedTenantViewSet):
     queryset = Enrollment.objects.select_related("program", "beneficiary", "beneficiary__household")
     serializer_class = EnrollmentSerializer
     tenant_field = "program__tenant"
-    allowed_roles = {User.Role.ADMIN, User.Role.REVIEWER}
+    allowed_roles = {User.Role.ADMIN, User.Role.REVIEWER, User.Role.FINANCE, User.Role.MANAGER, User.Role.AUDITOR}
+    write_roles = {User.Role.ADMIN, User.Role.REVIEWER}
 
 
 class PaymentInstructionViewSet(RoleProtectedTenantViewSet):
@@ -307,6 +367,12 @@ class PaymentInstructionViewSet(RoleProtectedTenantViewSet):
     tenant_field = "enrollment__program__tenant"
     allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER, User.Role.AUDITOR}
     write_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
+
+    def update(self, request, *args, **kwargs):
+        raise PermissionDenied("Payment instructions are immutable; use the controlled simulator actions")
+
+    def partial_update(self, request, *args, **kwargs):
+        raise PermissionDenied("Payment instructions are immutable; use the controlled simulator actions")
 
     def perform_create(self, serializer):
         instruction = serializer.save(
@@ -321,7 +387,13 @@ class PaymentInstructionViewSet(RoleProtectedTenantViewSet):
             recorded_by=self.request.user,
             redacted_payload={"simulation": True},
         )
-        audit(self.request.user, "PAYMENT_INSTRUCTION_CREATED", instruction, after=serializer.data)
+        audit(
+            self.request.user,
+            "PAYMENT_INSTRUCTION_CREATED",
+            instruction,
+            after=serializer.data,
+            tenant=instruction.enrollment.program.tenant,
+        )
 
     @action(detail=True, methods=["post"])
     @transaction.atomic
@@ -354,7 +426,14 @@ class PaymentInstructionViewSet(RoleProtectedTenantViewSet):
             recorded_by=request.user,
             redacted_payload={"simulation": True, "no_external_provider_call": True},
         )
-        audit(request.user, "PAYMENT_SIMULATED", instruction, before={"status": old_status}, after={"status": new_status})
+        audit(
+            request.user,
+            "PAYMENT_SIMULATED",
+            instruction,
+            before={"status": old_status},
+            after={"status": new_status},
+            tenant=instruction.enrollment.program.tenant,
+        )
         return Response(PaymentEventSerializer(event).data)
 
     @action(detail=True, methods=["get"])
@@ -373,7 +452,8 @@ class BudgetViewSet(RoleProtectedTenantViewSet):
     queryset = Budget.objects.select_related("program")
     serializer_class = BudgetSerializer
     tenant_field = "program__tenant"
-    allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
+    allowed_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER, User.Role.AUDITOR}
+    write_roles = {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER}
 
 
 class PaymentBatchViewSet(RoleProtectedTenantViewSet):
@@ -384,12 +464,12 @@ class PaymentBatchViewSet(RoleProtectedTenantViewSet):
 
     def perform_create(self, serializer):
         program = serializer.validated_data["program"]
-        if program.tenant_id != self.request.user.tenant_id:
+        if not self.request.user.is_superuser and program.tenant_id != self.request.user.tenant_id:
             raise ValidationError({"program": "Program belongs to another tenant"})
         if not program.workflow_config.get("payment_enabled", True):
             raise ValidationError({"program": "Payments are disabled for this program"})
-        batch = serializer.save(tenant=self.request.user.tenant, created_by=self.request.user, idempotency_key=str(uuid.uuid4()))
-        audit(self.request.user, "PAYMENT_BATCH_CREATED", batch, after=PaymentBatchSerializer(batch).data)
+        batch = serializer.save(tenant=program.tenant, created_by=self.request.user, idempotency_key=str(uuid.uuid4()))
+        audit(self.request.user, "PAYMENT_BATCH_CREATED", batch, after=PaymentBatchSerializer(batch).data, tenant=program.tenant)
 
 
 class AISignalViewSet(RoleProtectedTenantViewSet):
@@ -402,6 +482,12 @@ class AISignalViewSet(RoleProtectedTenantViewSet):
     def create(self, request, *args, **kwargs):
         raise PermissionDenied("AI signals are created only by controlled detection services")
 
+    def update(self, request, *args, **kwargs):
+        raise PermissionDenied("Use the controlled AI signal review action")
+
+    def partial_update(self, request, *args, **kwargs):
+        raise PermissionDenied("Use the controlled AI signal review action")
+
     @action(detail=True, methods=["post"])
     def review(self, request, pk=None):
         signal = self.get_object()
@@ -410,7 +496,7 @@ class AISignalViewSet(RoleProtectedTenantViewSet):
         signal.reviewed_by = request.user
         signal.reviewed_at = timezone.now()
         signal.save(update_fields=["status", "review_note", "reviewed_by", "reviewed_at"])
-        audit(request.user, "AI_SIGNAL_REVIEWED", signal, after={"status": signal.status})
+        audit(request.user, "AI_SIGNAL_REVIEWED", signal, after={"status": signal.status}, tenant=signal.tenant)
         return Response(AISignalSerializer(signal).data)
 
 
@@ -423,6 +509,12 @@ class ReconciliationItemViewSet(RoleProtectedTenantViewSet):
     def create(self, request, *args, **kwargs):
         raise PermissionDenied("Reconciliation items are created only by the reconciliation service")
 
+    def update(self, request, *args, **kwargs):
+        raise PermissionDenied("Use the controlled reconciliation resolution action")
+
+    def partial_update(self, request, *args, **kwargs):
+        raise PermissionDenied("Use the controlled reconciliation resolution action")
+
     @action(detail=True, methods=["post"])
     def resolve(self, request, pk=None):
         item = self.get_object()
@@ -431,7 +523,7 @@ class ReconciliationItemViewSet(RoleProtectedTenantViewSet):
         item.resolved_by = request.user
         item.resolved_at = timezone.now()
         item.save(update_fields=["status", "resolution_note", "resolved_by", "resolved_at"])
-        audit(request.user, "RECONCILIATION_ITEM_RESOLVED", item, after={"status": item.status})
+        audit(request.user, "RECONCILIATION_ITEM_RESOLVED", item, after={"status": item.status}, tenant=item.tenant)
         return Response(ReconciliationItemSerializer(item).data)
 
 
@@ -440,6 +532,15 @@ class ReviewTaskViewSet(RoleProtectedTenantViewSet):
     serializer_class = ReviewTaskSerializer
     allowed_roles = {User.Role.ADMIN, User.Role.REVIEWER, User.Role.MANAGER, User.Role.SUPPORT}
 
+    def create(self, request, *args, **kwargs):
+        raise PermissionDenied("Review tasks are created by controlled workflows and automation rules")
+
+    def update(self, request, *args, **kwargs):
+        raise PermissionDenied("Use the controlled review-task resolution action")
+
+    def partial_update(self, request, *args, **kwargs):
+        raise PermissionDenied("Use the controlled review-task resolution action")
+
     @action(detail=True, methods=["post"])
     def resolve(self, request, pk=None):
         task = self.get_object()
@@ -447,7 +548,7 @@ class ReviewTaskViewSet(RoleProtectedTenantViewSet):
         task.resolution = request.data.get("resolution", "")
         task.resolved_at = timezone.now()
         task.save(update_fields=["status", "resolution", "resolved_at"])
-        audit(request.user, "REVIEW_TASK_RESOLVED", task, after={"status": task.status})
+        audit(request.user, "REVIEW_TASK_RESOLVED", task, after={"status": task.status}, tenant=task.tenant)
         return Response(ReviewTaskSerializer(task).data)
 
 
@@ -477,57 +578,106 @@ class AutomationExecutionViewSet(TenantScopedModelViewSet):
     def create(self, request, *args, **kwargs):
         raise PermissionDenied("Automation executions are created by the controlled automation endpoint")
 
+    def update(self, request, *args, **kwargs):
+        raise PermissionDenied("Automation executions are immutable")
+
+    def partial_update(self, request, *args, **kwargs):
+        raise PermissionDenied("Automation executions are immutable")
+
 
 class AuditEventViewSet(viewsets.ReadOnlyModelViewSet):
     serializer_class = AuditEventSerializer
 
     def get_queryset(self):
+        if self.request.user.is_superuser:
+            return AuditEvent.objects.all()
         if self.request.user.role not in {User.Role.ADMIN, User.Role.MANAGER, User.Role.AUDITOR}:
-            raise PermissionDenied("Audit history is restricted")
+            raise PermissionDenied("Audit history is restricted to tenant administrators, managers, and auditors")
         return AuditEvent.objects.filter(tenant=self.request.user.tenant)
 
 
 @api_view(["GET"])
 def reports_view(request):
-    tenant = request.user.tenant
-    scope = {} if request.user.is_superuser else {"tenant": tenant}
-    programs = Program.objects.filter(**scope)
-    payments = PaymentInstruction.objects.all() if request.user.is_superuser else PaymentInstruction.objects.filter(enrollment__program__tenant=tenant)
-    enrollments = Enrollment.objects.all() if request.user.is_superuser else Enrollment.objects.filter(program__tenant=tenant)
-    complaints = Complaint.objects.all() if request.user.is_superuser else Complaint.objects.filter(beneficiary__household__tenant=tenant)
-    beneficiaries = Beneficiary.objects.all() if request.user.is_superuser else Beneficiary.objects.filter(household__tenant=tenant)
+    requested_tenant = request.query_params.get("tenant")
+    if request.user.is_superuser:
+        tenant = get_object_or_404(Tenant, id=requested_tenant) if requested_tenant else None
+        programs = Program.objects.filter(tenant=tenant) if tenant else Program.objects.all()
+    else:
+        if requested_tenant and requested_tenant != str(request.user.tenant_id):
+            raise PermissionDenied("You cannot access another tenant's dashboard")
+        tenant = request.user.tenant
+        programs = Program.objects.filter(tenant=tenant)
+    requested_program = request.query_params.get("program")
+    selected_program = None
+    if requested_program:
+        selected_program = get_object_or_404(programs, id=requested_program)
+        programs = programs.filter(id=selected_program.id)
+    households = Household.objects.filter(program__in=programs)
+    payments = PaymentInstruction.objects.filter(enrollment__program__in=programs)
+    enrollments = Enrollment.objects.filter(program__in=programs)
+    complaints = Complaint.objects.filter(beneficiary__household__program__in=programs)
+    beneficiaries = Beneficiary.objects.filter(household__program__in=programs)
+    budgets = Budget.objects.filter(program__in=programs)
     distributed = payments.filter(status=PaymentInstruction.Status.SUCCESS).aggregate(total=Sum("amount"))["total"] or 0
     approved = enrollments.filter(status=Enrollment.Status.APPROVED).count()
+    approved_amount = sum((program.transfer_amount * program.enrollments.filter(status=Enrollment.Status.APPROVED).count() for program in programs), 0)
+    budget_totals = budgets.aggregate(planned=Sum("planned_total"), actual=Sum("actual_total"))
+    dashboards = {
+        "beneficiaries": beneficiaries.count(),
+        "approvals": approved,
+        "paid": payments.filter(status=PaymentInstruction.Status.SUCCESS).count(),
+        "pending": payments.filter(status__in=[PaymentInstruction.Status.DRAFT, PaymentInstruction.Status.CREATED, PaymentInstruction.Status.SUBMITTED]).count(),
+        "failed": payments.filter(status=PaymentInstruction.Status.FAILED).count(),
+        "amounts_approved": str(approved_amount),
+        "amounts_distributed": str(distributed),
+        "budget_planned": str(budget_totals["planned"] or 0),
+        "budget_actual": str(budget_totals["actual"] or 0),
+        "budget_remaining": str((budget_totals["planned"] or 0) - (budget_totals["actual"] or 0)),
+        "geography": list(households.values("location").annotate(count=Count("id")).order_by("location")),
+        "reconciliation": list(payments.values("status").annotate(count=Count("id"), amount=Sum("amount")).order_by("status")),
+        "complaints": list(complaints.values("status").annotate(count=Count("id")).order_by("status")),
+        "operational_exceptions": payments.filter(Q(status=PaymentInstruction.Status.FAILED) | Q(complaints__isnull=False)).distinct().count(),
+        "program_kpis": list(programs.values("id", "name", "country", "currency", "status", "tenant__name").annotate(enrollments=Count("enrollments"))),
+    }
+    role_dashboard_fields = {
+        User.Role.FIELD_OFFICER: {"beneficiaries", "approvals"},
+        User.Role.SUPPORT: {"beneficiaries", "complaints", "operational_exceptions"},
+        User.Role.REVIEWER: {"beneficiaries", "approvals", "failed", "operational_exceptions"},
+        User.Role.FINANCE: {
+            "beneficiaries", "approvals", "paid", "pending", "failed", "amounts_approved",
+            "amounts_distributed", "budget_planned", "budget_actual", "budget_remaining",
+            "reconciliation", "operational_exceptions", "program_kpis",
+        },
+    }
+    if request.user.is_superuser or request.user.role in {User.Role.ADMIN, User.Role.MANAGER, User.Role.AUDITOR}:
+        permitted_dashboards = dashboards
+    else:
+        permitted_fields = role_dashboard_fields.get(request.user.role, set())
+        permitted_dashboards = {field: dashboards[field] for field in permitted_fields}
+    if request.user.is_superuser:
+        permitted_dashboards["tenant_count"] = Tenant.objects.count() if not tenant else 1
+        permitted_dashboards["system_administrator"] = True
     return Response({
-        "dashboards": {
-            "beneficiaries": beneficiaries.count(),
-            "approvals": approved,
-            "paid": payments.filter(status=PaymentInstruction.Status.SUCCESS).count(),
-            "pending": payments.filter(status__in=[PaymentInstruction.Status.DRAFT, PaymentInstruction.Status.CREATED, PaymentInstruction.Status.SUBMITTED]).count(),
-            "failed": payments.filter(status=PaymentInstruction.Status.FAILED).count(),
-            "amounts_approved": str(programs.aggregate(total=Sum("transfer_amount"))["total"] or 0),
-            "amounts_distributed": str(distributed),
-            "geography": list(Household.objects.filter(**scope).values("location").annotate(count=Count("id")).order_by("location")),
-            "reconciliation": list(payments.values("status").annotate(count=Count("id"), amount=Sum("amount")).order_by("status")),
-            "complaints": list(complaints.values("status").annotate(count=Count("id")).order_by("status")),
-            "operational_exceptions": payments.filter(Q(status=PaymentInstruction.Status.FAILED) | Q(complaints__isnull=False)).distinct().count(),
-            "program_kpis": list(programs.values("id", "name", "country", "currency", "status").annotate(enrollments=Count("enrollments"))),
-            "tenant_count": Tenant.objects.count() if request.user.is_superuser else 1,
-            "system_administrator": request.user.is_superuser,
-        }
+        "scope": {
+            "tenant_id": str(tenant.id) if tenant else None,
+            "tenant_name": tenant.name if tenant else "All tenants",
+            "program_id": str(selected_program.id) if selected_program else None,
+            "program_name": selected_program.name if selected_program else "All programs",
+        },
+        "dashboards": permitted_dashboards,
     })
 
 
 @api_view(["GET"])
 def program_summary_view(request, program_id):
-    program = get_object_or_404(Program, id=program_id, tenant=request.user.tenant)
+    program = scoped_program(request, program_id)
     payments = PaymentInstruction.objects.filter(enrollment__program=program)
     enrollments = Enrollment.objects.filter(program=program)
     complaints = Complaint.objects.filter(beneficiary__household__program=program)
     reconciliation = ReconciliationItem.objects.filter(program=program)
     budget = getattr(program, "budget", None)
     return Response({
-        "program": {"id": str(program.id), "name": program.name, "country_code": program.country_code, "currency": program.currency, "reporting_currency": program.reporting_currency, "timezone": program.timezone, "language": program.language},
+        "program": {"id": str(program.id), "name": program.name, "tenant_id": str(program.tenant_id), "tenant_name": program.tenant.name, "country_code": program.country_code, "currency": program.currency, "reporting_currency": program.reporting_currency, "timezone": program.timezone, "language": program.language},
         "beneficiaries": Beneficiary.objects.filter(household__program=program).count(),
         "eligibility": list(enrollments.values("eligibility_status").annotate(count=Count("id")).order_by("eligibility_status")),
         "approvals": enrollments.filter(status=Enrollment.Status.APPROVED).count(),
@@ -537,7 +687,7 @@ def program_summary_view(request, program_id):
         "reconciliation": list(reconciliation.values("issue_type", "status").annotate(count=Count("id")).order_by("issue_type")),
         "pdm": {"summary_source": "derived_api"},
         "complaints": list(complaints.values("status", "severity").annotate(count=Count("id")).order_by("status")),
-        "budget": {"planned_total": str(budget.planned_total), "actual_total": str(budget.actual_total)} if budget else None,
+        "budget": {"planned_total": str(budget.planned_total), "actual_total": str(budget.actual_total), "remaining": str(budget.planned_total - budget.actual_total), "status": budget.status} if budget else None,
         "verified": True,
     })
 
@@ -553,7 +703,8 @@ def imports_view(request):
         raise ValidationError({"file": "A CSV or XLSX file is required", "program_id": "Required"})
     if upload.size > 10 * 1024 * 1024:
         raise ValidationError({"file": "Maximum file size is 10 MB"})
-    program = get_object_or_404(Program, id=program_id, tenant=request.user.tenant)
+    program = scoped_program(request, program_id)
+    tenant = program.tenant
     content = upload.read()
     content_hash = sha256(content).hexdigest()
     if upload.name.lower().endswith(".csv"):
@@ -593,7 +744,7 @@ def imports_view(request):
         normalized_rows.append({"client_id": client_id, "size": household_size, "location": location, "registration_date": str(row.get("registration_date") or timezone.localdate()), "number": number, "full_name": full_name, "gender": str(row.get("gender") or "").strip(), "phone_last4": str(row.get("phone_last4") or "").strip()[-4:], "national_id_hash": str(row.get("national_id_hash") or "").strip(), "consent_given": str(row.get("consent_given") or "").lower() in {"1", "true", "yes", "y"}, "verification_status": verification_status})
     duplicate_candidates = 0
     for row in normalized_rows:
-        matches = Beneficiary.objects.filter(household__tenant=request.user.tenant)
+        matches = Beneficiary.objects.filter(household__tenant=tenant, household__program=program)
         if row["national_id_hash"]:
             matches = matches.filter(national_id_hash=row["national_id_hash"])
         elif row["phone_last4"]:
@@ -602,7 +753,7 @@ def imports_view(request):
             continue
         duplicate_candidates += matches.count()
     if not confirmation_token:
-        token = signing.dumps({"tenant_id": str(request.user.tenant_id), "program_id": str(program.id), "content_hash": content_hash})
+        token = signing.dumps({"user_id": str(request.user.id), "tenant_id": str(tenant.id), "program_id": str(program.id), "content_hash": content_hash})
         return Response({
             "status": "ready_for_confirmation" if normalized_rows else "invalid",
             "rows_received": len(rows),
@@ -618,21 +769,21 @@ def imports_view(request):
         confirmation = signing.loads(confirmation_token, max_age=15 * 60)
     except signing.BadSignature as exc:
         raise ValidationError({"confirmation_token": "Preview confirmation has expired or is invalid. Preview the file again."}) from exc
-    if confirmation != {"tenant_id": str(request.user.tenant_id), "program_id": str(program.id), "content_hash": content_hash}:
+    if confirmation != {"user_id": str(request.user.id), "tenant_id": str(tenant.id), "program_id": str(program.id), "content_hash": content_hash}:
         raise ValidationError({"confirmation_token": "This confirmation does not match the selected program and file."})
     if not normalized_rows:
         raise ValidationError({"file": "There are no valid rows to import."})
     households_created = beneficiaries_created = duplicate_flags = 0
     with transaction.atomic():
         for row in normalized_rows:
-            household, created = Household.objects.get_or_create(tenant=request.user.tenant, client_generated_id=row["client_id"], defaults={"program": program, "household_size": row["size"], "location": row["location"], "registration_date": row["registration_date"], "created_by": request.user})
+            household, created = Household.objects.get_or_create(tenant=tenant, client_generated_id=row["client_id"], defaults={"program": program, "household_size": row["size"], "location": row["location"], "registration_date": row["registration_date"], "created_by": request.user})
             if household.program_id != program.id:
                 raise ValidationError({"client_generated_id": f"{row['client_id']} belongs to another program"})
             beneficiary, beneficiary_created = Beneficiary.objects.update_or_create(household=household, number=row["number"], defaults={"full_name": row["full_name"], "gender": row["gender"], "phone_last4": row["phone_last4"], "national_id_hash": row["national_id_hash"], "consent_given": row["consent_given"], "verification_status": row["verification_status"], "created_by": request.user})
             households_created += int(created)
             beneficiaries_created += int(beneficiary_created)
-        duplicate_flags += int(run_deduplication_check(beneficiary)["matches"] > 0)
-    audit(request.user, "IMPORT_COMPLETED", program, after={"rows": len(normalized_rows), "rows_invalid": len(errors), "households_created": households_created, "beneficiaries_created": beneficiaries_created})
+            duplicate_flags += int(run_deduplication_check(beneficiary)["matches"] > 0)
+    audit(request.user, "IMPORT_COMPLETED", program, after={"rows": len(normalized_rows), "rows_invalid": len(errors), "households_created": households_created, "beneficiaries_created": beneficiaries_created}, tenant=tenant)
     return Response({
         "status": "completed",
         "rows_received": len(rows),
@@ -647,31 +798,63 @@ def imports_view(request):
 
 @api_view(["GET", "POST"])
 def pdm_view(request):
-    if request.user.role not in {User.Role.ADMIN, User.Role.SUPPORT, User.Role.FIELD_OFFICER, User.Role.MANAGER}:
+    if request.user.role not in {User.Role.ADMIN, User.Role.SUPPORT, User.Role.FIELD_OFFICER, User.Role.MANAGER, User.Role.AUDITOR}:
         raise PermissionDenied("Your role does not have permission for PDM")
     if request.method == "GET":
-        return Response(list(PDMResponse.objects.filter(tenant=request.user.tenant).values("id", "program", "channel", "location", "received_rate", "amount_received", "access_problem_rate", "complaint_rate", "satisfaction", "created_at")))
-    required = [field for field in ("program", "channel", "location", "received_rate") if request.data.get(field) in {None, ""}]
+        responses = PDMResponse.objects.all() if request.user.is_superuser else PDMResponse.objects.filter(tenant=request.user.tenant)
+        requested_tenant = request.query_params.get("tenant")
+        if requested_tenant:
+            if not request.user.is_superuser and requested_tenant != str(request.user.tenant_id):
+                raise PermissionDenied("You cannot access another tenant's PDM data")
+            responses = responses.filter(tenant=requested_tenant)
+        if request.query_params.get("program"):
+            program = scoped_program(request, request.query_params["program"])
+            responses = responses.filter(program=program)
+        return Response(list(responses.values("id", "tenant", "tenant__name", "program", "program__name", "channel", "location", "received_rate", "amount_received", "access_problem_rate", "complaint_rate", "satisfaction", "created_at")))
+    if request.user.role == User.Role.AUDITOR:
+        raise PermissionDenied("Auditors have read-only PDM access")
+    required = [field for field in ("program", "received_rate") if request.data.get(field) in {None, ""}]
     if required:
         raise ValidationError({field: "Required" for field in required})
-    program = get_object_or_404(Program, id=request.data.get("program"), tenant=request.user.tenant)
-    response = PDMResponse.objects.create(tenant=request.user.tenant, program=program, channel=request.data.get("channel", ""), location=request.data.get("location", ""), received_rate=request.data.get("received_rate", 0), amount_received=request.data.get("amount_received", 0), access_problem_rate=request.data.get("access_problem_rate", 0), complaint_rate=request.data.get("complaint_rate", 0), satisfaction=request.data.get("satisfaction", 0), created_by=request.user)
-    audit(request.user, "PDM_RESPONSE_CREATED", response, after={"program": str(program.id), "channel": response.channel, "location": response.location})
+    program = scoped_program(request, request.data.get("program"))
+    channel_values = PaymentChannelConfig.objects.filter(program=program, is_active=True).order_by("provider_name").values_list("channel_type", flat=True)[:1]
+    location_values = Household.objects.filter(program=program).order_by("registration_date").values_list("location", flat=True)[:1]
+    channel = request.data.get("channel") or next(iter(channel_values), "UNSPECIFIED")
+    location = request.data.get("location") or next(iter(location_values), "UNSPECIFIED")
+    response = PDMResponse.objects.create(tenant=program.tenant, program=program, channel=channel, location=location, received_rate=request.data.get("received_rate", 0), amount_received=request.data.get("amount_received", 0), access_problem_rate=request.data.get("access_problem_rate", 0), complaint_rate=request.data.get("complaint_rate", 0), satisfaction=request.data.get("satisfaction", 0), created_by=request.user)
+    audit(request.user, "PDM_RESPONSE_CREATED", response, after={"program": str(program.id), "channel": response.channel, "location": response.location}, tenant=program.tenant)
     return Response({"status": "created", "id": str(response.id), "submitted_at": response.created_at}, status=status.HTTP_201_CREATED)
 
 
 @api_view(["GET"])
 def pdm_summary_view(request):
-    if request.user.role not in {User.Role.ADMIN, User.Role.SUPPORT, User.Role.FIELD_OFFICER, User.Role.MANAGER}:
+    if request.user.role not in {User.Role.ADMIN, User.Role.SUPPORT, User.Role.FIELD_OFFICER, User.Role.MANAGER, User.Role.AUDITOR}:
         raise PermissionDenied("Your role does not have permission for PDM summaries")
-    responses = PDMResponse.objects.filter(tenant=request.user.tenant)
+    responses = PDMResponse.objects.all() if request.user.is_superuser else PDMResponse.objects.filter(tenant=request.user.tenant)
+    selected_tenant = None
+    requested_tenant = request.query_params.get("tenant")
+    if request.user.is_superuser and requested_tenant:
+        selected_tenant = get_object_or_404(Tenant, id=requested_tenant)
+        responses = responses.filter(tenant=selected_tenant)
+    elif not request.user.is_superuser:
+        if requested_tenant and requested_tenant != str(request.user.tenant_id):
+            raise PermissionDenied("You cannot access another tenant's PDM data")
+        selected_tenant = request.user.tenant
+    selected_program = None
     for field in ("program", "channel", "location"):
         if request.query_params.get(field):
-            responses = responses.filter(**{field: request.query_params[field]})
+            if field == "program":
+                selected_program = scoped_program(request, request.query_params[field])
+                if selected_tenant and selected_program.tenant_id != selected_tenant.id:
+                    raise PermissionDenied("The selected program does not belong to the selected tenant")
+                responses = responses.filter(program=selected_program)
+            else:
+                responses = responses.filter(**{field: request.query_params[field]})
     totals = responses.aggregate(received_rate=Sum("received_rate"), amount_received=Sum("amount_received"), access_problem_rate=Sum("access_problem_rate"), complaint_rate=Sum("complaint_rate"), satisfaction=Sum("satisfaction"), count=Count("id"))
     count = totals["count"] or 0
     return Response({
-        "program": request.query_params.get("program"),
+        "program": {"id": str(selected_program.id), "name": selected_program.name} if selected_program else None,
+        "tenant": {"id": str(selected_tenant.id), "name": selected_tenant.name} if selected_tenant else None,
         "channel": request.query_params.get("channel"),
         "location": request.query_params.get("location"),
         "received_rate": float(totals["received_rate"] / count) if count else 0,
@@ -696,7 +879,7 @@ def registration_sync_view(request):
 
     program = get_object_or_404(Program, id=program_id, tenant=request.user.tenant)
     household, household_created = Household.objects.get_or_create(
-        tenant=request.user.tenant,
+        tenant=program.tenant,
         client_generated_id=client_generated_id,
         defaults={
             "program": program,
@@ -727,7 +910,7 @@ def registration_sync_view(request):
             },
         )
         beneficiaries_created += int(created)
-    audit(request.user, "OFFLINE_REGISTRATION_SYNCED", household, after={"client_generated_id": client_generated_id})
+    audit(request.user, "OFFLINE_REGISTRATION_SYNCED", household, after={"client_generated_id": client_generated_id}, tenant=program.tenant)
     return Response({
         "status": "synchronized",
         "household_id": str(household.id),
@@ -751,7 +934,8 @@ def trigger_deduplication_api(request, beneficiary_id=None):
         beneficiary_uuid = uuid.UUID(str(beneficiary_id))
     except (ValueError, TypeError, AttributeError) as exc:
         raise ValidationError({"beneficiary_id": "Select a valid beneficiary record."}) from exc
-    beneficiary = get_object_or_404(Beneficiary, id=beneficiary_uuid, household__tenant=request.user.tenant)
+    beneficiaries = Beneficiary.objects.all() if request.user.is_superuser else Beneficiary.objects.filter(household__tenant=request.user.tenant)
+    beneficiary = get_object_or_404(beneficiaries, id=beneficiary_uuid)
     result = run_deduplication_check(beneficiary)
     return Response({
         "status": "completed",
@@ -773,7 +957,8 @@ def trigger_reconciliation_api(request):
     batch_id = request.data.get("batch_id")
     provider_report_data = request.data.get("provider_report_data", {})
     
-    batch = get_object_or_404(PaymentBatch, id=batch_id, tenant=request.user.tenant)
+    batches = PaymentBatch.objects.all() if request.user.is_superuser else PaymentBatch.objects.filter(tenant=request.user.tenant)
+    batch = get_object_or_404(batches, id=batch_id)
     results = run_automated_reconciliation(batch, provider_report_data)
     return Response({
         "status": "success",
@@ -790,7 +975,8 @@ def trigger_anomaly_detection_api(request):
     if request.user.role not in {User.Role.ADMIN, User.Role.FINANCE, User.Role.MANAGER, User.Role.AUDITOR}:
         raise PermissionDenied("Your role does not have permission to run payment risk scans")
     batch_id = request.data.get("batch_id")
-    batch = get_object_or_404(PaymentBatch, id=batch_id, tenant=request.user.tenant)
+    batches = PaymentBatch.objects.all() if request.user.is_superuser else PaymentBatch.objects.filter(tenant=request.user.tenant)
+    batch = get_object_or_404(batches, id=batch_id)
     signals = run_anomaly_detection(batch)
     return Response({
         "status": "completed",
@@ -803,18 +989,27 @@ def trigger_anomaly_detection_api(request):
 
 @api_view(["GET", "POST"])
 def ai_automation_status_view(request):
-    tenant = request.user.tenant
-    if request.user.role not in {User.Role.ADMIN, User.Role.MANAGER, User.Role.REVIEWER}:
+    read_roles = {
+        User.Role.ADMIN,
+        User.Role.MANAGER,
+        User.Role.REVIEWER,
+        User.Role.FINANCE,
+        User.Role.AUDITOR,
+    }
+    write_roles = {User.Role.ADMIN, User.Role.MANAGER, User.Role.REVIEWER}
+    allowed_roles = read_roles if request.method == "GET" else write_roles
+    if request.user.role not in allowed_roles:
         raise PermissionDenied("Your role does not have permission for AI and automation")
+    scope = {} if request.user.is_superuser else {"tenant": request.user.tenant}
     if request.method == "GET":
-        rules = AutomationRule.objects.filter(tenant=tenant)
-        signals = AISignal.objects.filter(tenant=tenant)
+        rules = AutomationRule.objects.filter(**scope)
+        signals = AISignal.objects.filter(**scope)
         return Response({
             "status": "active",
             "message": "Advisory signals and controlled automation are available.",
             "rules": list(rules.values("id", "event_name", "action_name", "is_active", "priority")),
             "signals_count": signals.count(),
-            "review_tasks_open": ReviewTask.objects.filter(tenant=tenant, status__in=[ReviewTask.Status.OPEN, ReviewTask.Status.ASSIGNED]).count(),
+            "review_tasks_open": ReviewTask.objects.filter(**scope, status__in=[ReviewTask.Status.OPEN, ReviewTask.Status.ASSIGNED]).count(),
             "advisory_only": True,
         })
     action_name = request.data.get("action")
@@ -827,14 +1022,15 @@ def ai_automation_status_view(request):
 def automation_execute_view(request):
     if request.user.role not in {User.Role.ADMIN, User.Role.MANAGER}:
         raise PermissionDenied("Only administrators and managers can execute configured automation")
-    rule = get_object_or_404(AutomationRule, id=request.data.get("rule_id"), tenant=request.user.tenant)
+    rules = AutomationRule.objects.all() if request.user.is_superuser else AutomationRule.objects.filter(tenant=request.user.tenant)
+    rule = get_object_or_404(rules, id=request.data.get("rule_id"))
     if not rule.is_active:
         raise ValidationError({"rule_id": "The automation rule is not active"})
     idempotency_key = request.data.get("idempotency_key")
     if not idempotency_key:
         raise ValidationError({"idempotency_key": "Required to prevent duplicate execution"})
     execution, created = AutomationExecution.objects.get_or_create(
-        tenant=request.user.tenant,
+        tenant=rule.tenant,
         rule=rule,
         idempotency_key=idempotency_key,
         defaults={"event_payload": request.data.get("event_payload", {}), "planned_action": {"action": rule.action_name}, "status": AutomationExecution.Status.BLOCKED},
@@ -844,7 +1040,7 @@ def automation_execute_view(request):
     if rule.action_name == "CREATE_REVIEW_TASK":
         payload = request.data.get("event_payload", {})
         _review_task = ReviewTask.objects.create(
-            tenant=request.user.tenant,
+            tenant=rule.tenant,
             program=rule.program,
             task_type=payload.get("task_type", ReviewTask.TaskType.DATA_QUALITY),
             entity_type=payload.get("entity_type", "AUTOMATION_EVENT"),
@@ -858,7 +1054,7 @@ def automation_execute_view(request):
         execution.status = AutomationExecution.Status.DRY_RUN
         execution.planned_action = {"action": rule.action_name, "reason": "Decision-sensitive actions remain human controlled."}
     execution.save(update_fields=["status", "planned_action"])
-    audit(request.user, "AUTOMATION_EXECUTED", execution, after=AutomationExecutionSerializer(execution).data)
+    audit(request.user, "AUTOMATION_EXECUTED", execution, after=AutomationExecutionSerializer(execution).data, tenant=rule.tenant)
     return Response(AutomationExecutionSerializer(execution).data, status=status.HTTP_201_CREATED)
 
 
@@ -870,7 +1066,7 @@ def ai_copilot_view(request):
     question = request.data.get("question", "")
     if not program_id:
         raise ValidationError({"program_id": "Required"})
-    program = get_object_or_404(Program, id=program_id, tenant=request.user.tenant)
+    program = scoped_program(request, program_id)
     return Response({"answer": "Verified metrics are returned for human interpretation; no eligibility, fraud, or payment decision is made automatically.", "question": question, "metrics": verified_program_summary(program), "verified": True, "advisory_only": True})
 
 
@@ -878,5 +1074,6 @@ def ai_copilot_view(request):
 def pipeline_status_view(request):
     if request.user.role not in {User.Role.ADMIN, User.Role.MANAGER, User.Role.AUDITOR}:
         raise PermissionDenied("Your role does not have permission to inspect pipeline status")
-    tenant = request.user.tenant
-    return Response({"status": "completed", "pipeline": ["validation", "deduplication", "risk_signals", "human_review", "reconciliation", "verified_reporting"], "records": {"beneficiaries": Beneficiary.objects.filter(household__tenant=tenant).count(), "signals": AISignal.objects.filter(tenant=tenant).count(), "review_tasks": ReviewTask.objects.filter(tenant=tenant).count()}, "automation_execution": "controlled", "tenant_isolated": True})
+    signal_scope = {} if request.user.is_superuser else {"tenant": request.user.tenant}
+    beneficiary_scope = {} if request.user.is_superuser else {"household__tenant": request.user.tenant}
+    return Response({"status": "completed", "pipeline": ["validation", "deduplication", "risk_signals", "human_review", "reconciliation", "verified_reporting"], "records": {"beneficiaries": Beneficiary.objects.filter(**beneficiary_scope).count(), "signals": AISignal.objects.filter(**signal_scope).count(), "review_tasks": ReviewTask.objects.filter(**signal_scope).count()}, "automation_execution": "controlled", "tenant_isolated": not request.user.is_superuser})

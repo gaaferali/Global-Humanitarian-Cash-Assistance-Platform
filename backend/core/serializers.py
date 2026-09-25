@@ -72,6 +72,8 @@ class LoginSerializer(serializers.Serializer):
 
 
 class ProgramSerializer(serializers.ModelSerializer):
+    tenant_name = serializers.CharField(source="tenant.name", read_only=True)
+
     class Meta:
         model = Program
         fields = "__all__"
@@ -79,6 +81,9 @@ class ProgramSerializer(serializers.ModelSerializer):
 
 
 class ProgramActivitySerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source="program.name", read_only=True)
+    owner_name = serializers.CharField(source="owner.full_name", read_only=True)
+
     class Meta:
         model = ProgramActivity
         fields = "__all__"
@@ -88,7 +93,7 @@ class ProgramActivitySerializer(serializers.ModelSerializer):
         program = attrs.get("program") or self.instance.program
         owner = attrs.get("owner")
         progress = attrs.get("progress")
-        if program.tenant_id != self.context["request"].user.tenant_id:
+        if not self.context["request"].user.is_superuser and program.tenant_id != self.context["request"].user.tenant_id:
             raise serializers.ValidationError("Program belongs to another tenant")
         if owner and owner.tenant_id != program.tenant_id:
             raise serializers.ValidationError({"owner": "Owner belongs to another tenant"})
@@ -98,6 +103,9 @@ class ProgramActivitySerializer(serializers.ModelSerializer):
 
 
 class ActivityDependencySerializer(serializers.ModelSerializer):
+    predecessor_name = serializers.CharField(source="predecessor.name", read_only=True)
+    successor_name = serializers.CharField(source="successor.name", read_only=True)
+
     class Meta:
         model = ActivityDependency
         fields = "__all__"
@@ -106,8 +114,11 @@ class ActivityDependencySerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         predecessor = attrs.get("predecessor") or self.instance.predecessor
         successor = attrs.get("successor") or self.instance.successor
+        user = self.context["request"].user
         if predecessor == successor or predecessor.tenant_id != successor.tenant_id or predecessor.program_id != successor.program_id:
             raise serializers.ValidationError("Dependencies must link different activities in the same tenant and program")
+        if not user.is_superuser and predecessor.tenant_id != user.tenant_id:
+            raise serializers.ValidationError("Activities belong to another tenant")
         seen, stack = set(), [successor]
         while stack:
             activity = stack.pop()
@@ -121,6 +132,9 @@ class ActivityDependencySerializer(serializers.ModelSerializer):
 
 
 class HouseholdSerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source="program.name", read_only=True)
+    registration_reference = serializers.SerializerMethodField()
+
     class Meta:
         model = Household
         fields = "__all__"
@@ -131,8 +145,15 @@ class HouseholdSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Program belongs to another tenant")
         return program
 
+    def get_registration_reference(self, household):
+        return household.client_generated_id or f"HH-{str(household.id).split('-')[0].upper()}"
+
 
 class BeneficiarySerializer(serializers.ModelSerializer):
+    household_reference = serializers.SerializerMethodField()
+    program_name = serializers.CharField(source="household.program.name", read_only=True)
+    masked_phone = serializers.SerializerMethodField()
+
     class Meta:
         model = Beneficiary
         fields = "__all__"
@@ -143,8 +164,26 @@ class BeneficiarySerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Household belongs to another tenant")
         return household
 
+    def validate(self, attrs):
+        request = self.context["request"]
+        protected_fields = {"verification_status", "status"}
+        if request.user.role == User.Role.FIELD_OFFICER and protected_fields.intersection(attrs):
+            raise serializers.ValidationError("Field officers cannot set verification or workflow status.")
+        return attrs
+
+    def get_household_reference(self, beneficiary):
+        household = beneficiary.household
+        return household.client_generated_id or f"HH-{str(household.id).split('-')[0].upper()}"
+
+    def get_masked_phone(self, beneficiary):
+        return f"•••• {beneficiary.phone_last4}" if beneficiary.phone_last4 else "Not recorded"
+
 
 class EnrollmentSerializer(serializers.ModelSerializer):
+    beneficiary_name = serializers.CharField(source="beneficiary.full_name", read_only=True)
+    beneficiary_number = serializers.CharField(source="beneficiary.number", read_only=True)
+    program_name = serializers.CharField(source="program.name", read_only=True)
+
     class Meta:
         model = Enrollment
         fields = "__all__"
@@ -153,12 +192,18 @@ class EnrollmentSerializer(serializers.ModelSerializer):
     def validate(self, attrs):
         beneficiary = attrs.get("beneficiary") or self.instance.beneficiary
         program = attrs.get("program") or self.instance.program
+        user = self.context["request"].user
         if beneficiary.household.tenant_id != program.tenant_id:
             raise serializers.ValidationError("Beneficiary and program must belong to the same tenant")
+        if not user.is_superuser and program.tenant_id != user.tenant_id:
+            raise serializers.ValidationError("Program belongs to another tenant")
         return attrs
 
     def update(self, instance, validated_data):
         status = validated_data.get("status")
+        eligibility_status = validated_data.get("eligibility_status", instance.eligibility_status)
+        if status == Enrollment.Status.APPROVED and eligibility_status != Enrollment.EligibilityStatus.ELIGIBLE:
+            raise serializers.ValidationError({"status": "Only an eligible enrollment can be approved."})
         if status in {Enrollment.Status.APPROVED, Enrollment.Status.REJECTED}:
             instance.approved_by = self.context["request"].user
             instance.approved_at = timezone.now()
@@ -166,28 +211,37 @@ class EnrollmentSerializer(serializers.ModelSerializer):
 
 
 class PaymentChannelConfigSerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source="program.name", read_only=True)
+
     class Meta:
         model = PaymentChannelConfig
         fields = "__all__"
 
 
 class PaymentInstructionSerializer(serializers.ModelSerializer):
+    beneficiary_name = serializers.CharField(source="beneficiary.full_name", read_only=True)
+    program_name = serializers.CharField(source="enrollment.program.name", read_only=True)
+    channel_name = serializers.CharField(source="channel_config.provider_name", read_only=True)
+
     class Meta:
         model = PaymentInstruction
         fields = "__all__"
         read_only_fields = ["created_by", "created_at", "status", "provider_reference", "idempotency_key"]
 
     def validate(self, attrs):
-        enrollment = attrs["enrollment"]
-        beneficiary = attrs["beneficiary"]
-        channel_config = attrs["channel_config"]
+        enrollment = attrs.get("enrollment") or self.instance.enrollment
+        beneficiary = attrs.get("beneficiary") or self.instance.beneficiary
+        channel_config = attrs.get("channel_config") or self.instance.channel_config
+        batch = attrs.get("batch", self.instance.batch if self.instance else None)
         if enrollment.status != Enrollment.Status.APPROVED:
             raise serializers.ValidationError("Payment instruction requires an approved enrollment")
         if beneficiary.pk != enrollment.beneficiary.pk:
             raise serializers.ValidationError("Beneficiary must match enrollment")
         if channel_config.program.pk != enrollment.program.pk:
             raise serializers.ValidationError("Channel must belong to the enrollment program")
-        if enrollment.program.tenant.pk != self.context["request"].user.tenant.pk:
+        if batch and (batch.tenant_id != enrollment.program.tenant_id or batch.program_id != enrollment.program_id):
+            raise serializers.ValidationError({"batch": "Payment batch must belong to the enrollment program"})
+        if not self.context["request"].user.is_superuser and enrollment.program.tenant_id != self.context["request"].user.tenant_id:
             raise serializers.ValidationError("Enrollment belongs to another tenant")
         if not enrollment.program.workflow_config.get("payment_enabled", True):
             raise serializers.ValidationError("Payments are disabled for this program")
@@ -203,6 +257,8 @@ class PaymentEventSerializer(serializers.ModelSerializer):
 
 
 class PaymentBatchSerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source="program.name", read_only=True)
+
     class Meta:
         model = PaymentBatch
         fields = "__all__"
@@ -210,6 +266,10 @@ class PaymentBatchSerializer(serializers.ModelSerializer):
 
 
 class ComplaintSerializer(serializers.ModelSerializer):
+    beneficiary_name = serializers.CharField(source="beneficiary.full_name", read_only=True)
+    household_reference = serializers.SerializerMethodField()
+    assigned_to_name = serializers.CharField(source="assigned_to.full_name", read_only=True)
+
     class Meta:
         model = Complaint
         fields = "__all__"
@@ -220,13 +280,25 @@ class ComplaintSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Beneficiary belongs to another tenant")
         return beneficiary
 
+    def validate(self, attrs):
+        beneficiary = attrs.get("beneficiary") or self.instance.beneficiary
+        assigned_to = attrs.get("assigned_to")
+        if assigned_to and assigned_to.tenant_id != beneficiary.household.tenant_id:
+            raise serializers.ValidationError({"assigned_to": "Assignee belongs to another tenant."})
+        return attrs
+
     def update(self, instance, validated_data):
         if validated_data.get("status") in {Complaint.Status.RESOLVED, Complaint.Status.CLOSED}:
             instance.resolved_at = timezone.now()
         return super().update(instance, validated_data)
 
+    def get_household_reference(self, complaint):
+        household = complaint.beneficiary.household
+        return household.client_generated_id or f"HH-{str(household.id).split('-')[0].upper()}"
+
 
 class BudgetSerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source="program.name", read_only=True)
     class Meta:
         model = Budget
         fields = "__all__"
@@ -269,6 +341,8 @@ class AuditEventSerializer(serializers.ModelSerializer):
 
 
 class AISignalSerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source="program.name", read_only=True)
+
     class Meta:
         model = AISignal
         fields = "__all__"
@@ -276,6 +350,9 @@ class AISignalSerializer(serializers.ModelSerializer):
 
 
 class ReconciliationItemSerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source="program.name", read_only=True)
+    instruction_reference = serializers.CharField(source="instruction.provider_reference", read_only=True)
+
     class Meta:
         model = ReconciliationItem
         fields = "__all__"
@@ -283,10 +360,23 @@ class ReconciliationItemSerializer(serializers.ModelSerializer):
 
 
 class ReviewTaskSerializer(serializers.ModelSerializer):
+    program_name = serializers.CharField(source="program.name", read_only=True)
+    assigned_to_name = serializers.CharField(source="assigned_to.full_name", read_only=True)
+
     class Meta:
         model = ReviewTask
         fields = "__all__"
         read_only_fields = ["tenant", "created_at", "resolved_at"]
+
+    def validate(self, attrs):
+        user = self.context["request"].user
+        program = attrs.get("program") or getattr(self.instance, "program", None)
+        assigned_to = attrs.get("assigned_to")
+        if program and not user.is_superuser and program.tenant_id != user.tenant_id:
+            raise serializers.ValidationError({"program": "Program belongs to another tenant"})
+        if assigned_to and program and assigned_to.tenant_id != program.tenant_id:
+            raise serializers.ValidationError({"assigned_to": "Assignee belongs to another tenant"})
+        return attrs
 
 
 class AutomationRuleSerializer(serializers.ModelSerializer):
@@ -294,6 +384,13 @@ class AutomationRuleSerializer(serializers.ModelSerializer):
         model = AutomationRule
         fields = "__all__"
         read_only_fields = ["tenant", "created_at"]
+
+    def validate(self, attrs):
+        user = self.context["request"].user
+        program = attrs.get("program") or getattr(self.instance, "program", None)
+        if program and not user.is_superuser and program.tenant_id != user.tenant_id:
+            raise serializers.ValidationError({"program": "Program belongs to another tenant"})
+        return attrs
 
 
 class AutomationExecutionSerializer(serializers.ModelSerializer):
