@@ -6,22 +6,6 @@ from django.db import models
 from django.utils import timezone as django_timezone
 
 
-class AutomationRule(models.Model):
-    name = models.CharField(max_length=255)
-    is_active = models.BooleanField(default=True)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return self.name
-
-class ReconciliationItem(models.Model):
-    status = models.CharField(max_length=50, default="PENDING")
-    amount = models.DecimalField(max_digits=12, decimal_places=2, default=0.00)
-    created_at = models.DateTimeField(auto_now_add=True)
-
-    def __str__(self):
-        return f"Item {self.id} - {self.status}"
-
 class Tenant(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
     name = models.CharField(max_length=255)
@@ -285,6 +269,73 @@ class Complaint(models.Model):
     resolved_at = models.DateTimeField(null=True, blank=True)
     created_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name="created_complaints")
     created_at = models.DateTimeField(default=django_timezone.now)
+
+
+class PDMResponse(models.Model):
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.PROTECT, related_name="pdm_responses")
+    program = models.ForeignKey(Program, on_delete=models.PROTECT, related_name="pdm_responses")
+    channel = models.CharField(max_length=120)
+    location = models.CharField(max_length=255)
+    received_rate = models.DecimalField(max_digits=5, decimal_places=2)
+    amount_received = models.DecimalField(max_digits=18, decimal_places=2, default=0)
+    access_problem_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    complaint_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    satisfaction = models.DecimalField(max_digits=5, decimal_places=2, default=0)
+    created_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name="created_pdm_responses")
+    created_at = models.DateTimeField(default=django_timezone.now)
+
+
+class ProgramActivity(models.Model):
+    class Status(models.TextChoices):
+        NOT_STARTED = "NOT_STARTED", "Not started"
+        IN_PROGRESS = "IN_PROGRESS", "In progress"
+        BLOCKED = "BLOCKED", "Blocked"
+        COMPLETED = "COMPLETED", "Completed"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    tenant = models.ForeignKey(Tenant, on_delete=models.PROTECT, related_name="activities")
+    program = models.ForeignKey(Program, on_delete=models.PROTECT, related_name="activities")
+    name = models.CharField(max_length=255)
+    description = models.TextField(blank=True)
+    workstream = models.CharField(max_length=120, blank=True)
+    owner = models.ForeignKey(User, null=True, blank=True, on_delete=models.PROTECT, related_name="assigned_activities")
+    status = models.CharField(max_length=20, choices=Status.choices, default=Status.NOT_STARTED)
+    planned_start = models.DateField(null=True, blank=True)
+    planned_end = models.DateField(null=True, blank=True)
+    actual_start = models.DateField(null=True, blank=True)
+    actual_end = models.DateField(null=True, blank=True)
+    progress = models.PositiveSmallIntegerField(default=0)
+    risk = models.CharField(max_length=20, blank=True)
+    is_milestone = models.BooleanField(default=False)
+    created_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name="created_activities")
+    created_at = models.DateTimeField(default=django_timezone.now)
+    updated_at = models.DateTimeField(auto_now=True)
+
+    class Meta:
+        constraints = [
+            models.CheckConstraint(
+                condition=models.Q(progress__gte=0) & models.Q(progress__lte=100),
+                name="program_activity_progress_range",
+            ),
+        ]
+
+
+class ActivityDependency(models.Model):
+    class Relationship(models.TextChoices):
+        FINISH_TO_START = "FS", "Finish to start"
+
+    id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
+    predecessor = models.ForeignKey(ProgramActivity, on_delete=models.PROTECT, related_name="successor_dependencies")
+    successor = models.ForeignKey(ProgramActivity, on_delete=models.PROTECT, related_name="predecessor_dependencies")
+    relationship_type = models.CharField(max_length=10, choices=Relationship.choices, default=Relationship.FINISH_TO_START)
+    lag_days = models.IntegerField(default=0)
+    reason = models.TextField(blank=True)
+    created_by = models.ForeignKey(User, on_delete=models.PROTECT, related_name="created_activity_dependencies")
+    created_at = models.DateTimeField(default=django_timezone.now)
+
+    class Meta:
+        constraints = [models.UniqueConstraint(fields=["predecessor", "successor"], name="unique_activity_dependency")]
 
 
 class Budget(models.Model):

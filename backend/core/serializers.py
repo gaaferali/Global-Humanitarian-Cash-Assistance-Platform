@@ -7,6 +7,7 @@ from .models import (
     AuditEvent,
     AutomationExecution,
     AutomationRule,
+    ActivityDependency,
     Beneficiary,
     Budget,
     Complaint,
@@ -16,6 +17,7 @@ from .models import (
     PaymentEvent,
     PaymentInstruction,
     PaymentBatch,
+    ProgramActivity,
     Program,
     ReconciliationItem,
     ReviewTask,
@@ -32,11 +34,12 @@ class TenantSerializer(serializers.ModelSerializer):
 
 class UserSerializer(serializers.ModelSerializer):
     tenant = TenantSerializer(read_only=True)
+    tenant_id = serializers.PrimaryKeyRelatedField(source="tenant", queryset=Tenant.objects.all(), write_only=True, required=False)
     password = serializers.CharField(write_only=True, required=False)
 
     class Meta:
         model = User
-        fields = ["id", "tenant", "email", "full_name", "role", "is_active", "is_staff", "created_at", "password"]
+        fields = ["id", "tenant", "tenant_id", "email", "full_name", "role", "is_active", "is_staff", "is_superuser", "created_at", "password"]
         read_only_fields = ["id", "tenant", "created_at"]
 
     def create(self, validated_data):
@@ -63,7 +66,7 @@ class LoginSerializer(serializers.Serializer):
     def validate(self, attrs):
         user = authenticate(username=attrs["email"], password=attrs["password"])
         if not user or not user.is_active:
-            raise serializers.ValidationError("Invalid credentials")
+            raise serializers.ValidationError("Email or password is incorrect.")
         attrs["user"] = user
         return attrs
 
@@ -73,6 +76,48 @@ class ProgramSerializer(serializers.ModelSerializer):
         model = Program
         fields = "__all__"
         read_only_fields = ["tenant", "created_by", "created_at"]
+
+
+class ProgramActivitySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ProgramActivity
+        fields = "__all__"
+        read_only_fields = ["tenant", "created_by", "created_at", "updated_at"]
+
+    def validate(self, attrs):
+        program = attrs.get("program") or self.instance.program
+        owner = attrs.get("owner")
+        progress = attrs.get("progress")
+        if program.tenant_id != self.context["request"].user.tenant_id:
+            raise serializers.ValidationError("Program belongs to another tenant")
+        if owner and owner.tenant_id != program.tenant_id:
+            raise serializers.ValidationError({"owner": "Owner belongs to another tenant"})
+        if progress is not None and progress > 100:
+            raise serializers.ValidationError({"progress": "Progress must be between 0 and 100"})
+        return attrs
+
+
+class ActivityDependencySerializer(serializers.ModelSerializer):
+    class Meta:
+        model = ActivityDependency
+        fields = "__all__"
+        read_only_fields = ["created_by", "created_at"]
+
+    def validate(self, attrs):
+        predecessor = attrs.get("predecessor") or self.instance.predecessor
+        successor = attrs.get("successor") or self.instance.successor
+        if predecessor == successor or predecessor.tenant_id != successor.tenant_id or predecessor.program_id != successor.program_id:
+            raise serializers.ValidationError("Dependencies must link different activities in the same tenant and program")
+        seen, stack = set(), [successor]
+        while stack:
+            activity = stack.pop()
+            if activity.id == predecessor.id:
+                raise serializers.ValidationError("This dependency would create a cycle")
+            if activity.id in seen:
+                continue
+            seen.add(activity.id)
+            stack.extend(dependency.successor for dependency in activity.successor_dependencies.all())
+        return attrs
 
 
 class HouseholdSerializer(serializers.ModelSerializer):
@@ -144,6 +189,10 @@ class PaymentInstructionSerializer(serializers.ModelSerializer):
             raise serializers.ValidationError("Channel must belong to the enrollment program")
         if enrollment.program.tenant.pk != self.context["request"].user.tenant.pk:
             raise serializers.ValidationError("Enrollment belongs to another tenant")
+        if not enrollment.program.workflow_config.get("payment_enabled", True):
+            raise serializers.ValidationError("Payments are disabled for this program")
+        if PaymentInstruction.objects.filter(enrollment=enrollment).exists():
+            raise serializers.ValidationError("A payment instruction already exists for this enrollment; use its controlled retry action instead")
         return attrs
 
 
@@ -157,7 +206,7 @@ class PaymentBatchSerializer(serializers.ModelSerializer):
     class Meta:
         model = PaymentBatch
         fields = "__all__"
-        read_only_fields = ["tenant", "created_by", "created_at"]
+        read_only_fields = ["tenant", "created_by", "created_at", "idempotency_key"]
 
 
 class ComplaintSerializer(serializers.ModelSerializer):
