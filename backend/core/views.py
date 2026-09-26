@@ -128,6 +128,21 @@ def scoped_program(request, program_id):
     return get_object_or_404(programs, id=program_id)
 
 
+def normalize_import_header(value):
+    key = str(value or "").strip().lower().replace(" ", "_").replace("-", "_")
+    return {
+        "phone": "phone_number",
+        "mobile": "phone_number",
+        "mobile_number": "phone_number",
+        "beneficiary_no": "beneficiary_number",
+        "national_id_number": "national_id",
+    }.get(key, key)
+
+
+def normalize_import_rows(rows):
+    return [{normalize_import_header(key): value for key, value in row.items()} for row in rows]
+
+
 class TenantScopedModelViewSet(viewsets.ModelViewSet):
     tenant_field = "tenant"
 
@@ -279,6 +294,36 @@ class ProgramViewSet(RoleProtectedTenantViewSet):
     }
     write_roles = {User.Role.ADMIN, User.Role.MANAGER}
 
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        program = self.get_object()
+        household_ids = list(program.households.values_list("id", flat=True))
+        beneficiary_ids = list(Beneficiary.objects.filter(household_id__in=household_ids).values_list("id", flat=True))
+        enrollment_ids = list(Enrollment.objects.filter(program=program).values_list("id", flat=True))
+        instruction_ids = list(PaymentInstruction.objects.filter(enrollment_id__in=enrollment_ids).values_list("id", flat=True))
+        activity_ids = list(program.activities.values_list("id", flat=True))
+        rule_ids = list(program.automation_rules.values_list("id", flat=True))
+        audit(request.user, "PROGRAM_DELETED", program, after={"deleted_dependency_counts": {"households": len(household_ids), "beneficiaries": len(beneficiary_ids), "enrollments": len(enrollment_ids), "payment_instructions": len(instruction_ids), "activities": len(activity_ids), "automation_rules": len(rule_ids)}}, tenant=program.tenant)
+        Complaint.objects.filter(Q(beneficiary_id__in=beneficiary_ids) | Q(instruction_id__in=instruction_ids)).delete()
+        PaymentEvent.objects.filter(instruction_id__in=instruction_ids).delete()
+        ReconciliationItem.objects.filter(Q(program=program) | Q(instruction_id__in=instruction_ids)).delete()
+        PaymentInstruction.objects.filter(id__in=instruction_ids).delete()
+        Enrollment.objects.filter(id__in=enrollment_ids).delete()
+        Beneficiary.objects.filter(id__in=beneficiary_ids).delete()
+        Household.objects.filter(id__in=household_ids).delete()
+        ActivityDependency.objects.filter(Q(predecessor_id__in=activity_ids) | Q(successor_id__in=activity_ids)).delete()
+        ProgramActivity.objects.filter(id__in=activity_ids).delete()
+        AutomationExecution.objects.filter(rule_id__in=rule_ids).delete()
+        AutomationRule.objects.filter(id__in=rule_ids).delete()
+        AISignal.objects.filter(program=program).delete()
+        ReviewTask.objects.filter(program=program).delete()
+        PDMResponse.objects.filter(program=program).delete()
+        PaymentChannelConfig.objects.filter(program=program).delete()
+        PaymentBatch.objects.filter(program=program).delete()
+        Budget.objects.filter(program=program).delete()
+        program.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
     def initial(self, request, *args, **kwargs):
         TenantScopedModelViewSet.initial(self, request, *args, **kwargs)
         if request.user.role not in self.allowed_roles:
@@ -356,6 +401,28 @@ class BeneficiaryViewSet(RoleProtectedTenantViewSet):
     tenant_field = "household__tenant"
     allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER, User.Role.SUPPORT, User.Role.MANAGER, User.Role.AUDITOR}
     write_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.MANAGER}
+
+    @transaction.atomic
+    def destroy(self, request, *args, **kwargs):
+        if request.user.role not in {User.Role.ADMIN, User.Role.MANAGER}:
+            raise PermissionDenied("Only administrators and managers can delete beneficiaries")
+        beneficiary = self.get_object()
+        enrollment_ids = list(beneficiary.enrollments.values_list("id", flat=True))
+        instruction_ids = list(PaymentInstruction.objects.filter(enrollment_id__in=enrollment_ids).values_list("id", flat=True))
+        audit(request.user, "BENEFICIARY_DELETED", beneficiary, after={"deleted_dependency_counts": {"enrollments": len(enrollment_ids), "payment_instructions": len(instruction_ids)}}, tenant=beneficiary.household.tenant)
+        Complaint.objects.filter(Q(beneficiary=beneficiary) | Q(instruction_id__in=instruction_ids)).delete()
+        PaymentEvent.objects.filter(instruction_id__in=instruction_ids).delete()
+        ReconciliationItem.objects.filter(instruction_id__in=instruction_ids).delete()
+        PaymentInstruction.objects.filter(id__in=instruction_ids).delete()
+        Enrollment.objects.filter(id__in=enrollment_ids).delete()
+        AISignal.objects.filter(entity_type="BENEFICIARY", entity_id=str(beneficiary.id)).delete()
+        ReviewTask.objects.filter(entity_type="BENEFICIARY", entity_id=str(beneficiary.id)).delete()
+        household = beneficiary.household
+        beneficiary.delete()
+        if not household.beneficiaries.exists():
+            audit(request.user, "HOUSEHOLD_DELETED_AFTER_LAST_BENEFICIARY", household, after={"reason": "last_beneficiary_deleted"}, tenant=household.tenant)
+            household.delete()
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
 
 class EnrollmentViewSet(RoleProtectedTenantViewSet):
@@ -641,12 +708,13 @@ def reports_view(request):
         "geography": list(households.values("location").annotate(count=Count("id")).order_by("location")),
         "reconciliation": list(payments.values("status").annotate(count=Count("id"), amount=Sum("amount")).order_by("status")),
         "complaints": list(complaints.values("status").annotate(count=Count("id")).order_by("status")),
+        "assigned_complaints": list(complaints.filter(assigned_to=request.user).values("id", "category", "severity", "status", "resolution_notes", "beneficiary__full_name", "beneficiary__household__program__name").order_by("status", "-created_at")),
         "operational_exceptions": payments.filter(Q(status=PaymentInstruction.Status.FAILED) | Q(complaints__isnull=False)).distinct().count(),
         "program_kpis": list(programs.values("id", "name", "country", "currency", "status", "tenant__name").annotate(enrollments=Count("enrollments"))),
     }
     role_dashboard_fields = {
         User.Role.FIELD_OFFICER: {"beneficiaries", "approvals"},
-        User.Role.SUPPORT: {"beneficiaries", "complaints", "operational_exceptions"},
+        User.Role.SUPPORT: {"beneficiaries", "complaints", "assigned_complaints", "operational_exceptions"},
         User.Role.REVIEWER: {"beneficiaries", "approvals", "failed", "operational_exceptions"},
         User.Role.FINANCE: {
             "beneficiaries", "approvals", "paid", "pending", "failed", "amounts_approved",
@@ -722,6 +790,7 @@ def imports_view(request):
         rows = [dict(zip(headers, row)) for row in values[1:] if any(value is not None and str(value).strip() for value in row)]
     else:
         raise ValidationError({"file": "Use a .csv or .xlsx file"})
+    rows = normalize_import_rows(rows)
     available_columns = set(rows[0].keys()) if rows else set()
     required_columns = {"client_generated_id", "household_size", "location", "full_name"}
     missing_columns = sorted(required_columns - available_columns)
@@ -1034,6 +1103,20 @@ def trigger_reconciliation_api(request):
         raise PermissionDenied("Your role does not have permission to reconcile payment batches")
     batch_id = request.data.get("batch_id")
     provider_report_data = request.data.get("provider_report_data", {})
+    if not isinstance(provider_report_data, dict):
+        raise ValidationError({"provider_report_data": "Provide a JSON object keyed by provider reference."})
+    for provider_reference, record in provider_report_data.items():
+        if not isinstance(record, dict):
+            raise ValidationError({"provider_report_data": f"The record for {provider_reference} must be a JSON object."})
+        if "amount" not in record or "status" not in record:
+            raise ValidationError({"provider_report_data": f"The record for {provider_reference} must include amount and status."})
+        try:
+            if Decimal(str(record["amount"])) < 0:
+                raise ValueError
+        except (TypeError, ValueError, ArithmeticError) as exc:
+            raise ValidationError({"provider_report_data": f"The amount for {provider_reference} must be a non-negative number."}) from exc
+        if str(record["status"]).upper() not in {"SUCCESS", "FAILED", "REVERSED", "PENDING"}:
+            raise ValidationError({"provider_report_data": f"The status for {provider_reference} must be SUCCESS, FAILED, REVERSED, or PENDING."})
     
     batches = PaymentBatch.objects.all() if request.user.is_superuser else PaymentBatch.objects.filter(tenant=request.user.tenant)
     batch = get_object_or_404(batches, id=batch_id)

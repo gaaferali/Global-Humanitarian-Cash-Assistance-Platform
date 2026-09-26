@@ -226,7 +226,7 @@ class BeneficiarySerializer(serializers.ModelSerializer):
 
     def get_masked_phone(self, beneficiary):
         phone_number = beneficiary.phone_number or beneficiary.phone_last4
-        return f"•••• {phone_number[-4:]}" if phone_number else "Not recorded"
+        return f"**** {phone_number[-4:]}" if phone_number else "Not recorded"
 
 
 class EnrollmentSerializer(serializers.ModelSerializer):

@@ -1,4 +1,5 @@
 from django.test import TestCase
+from django.core.files.uploadedfile import SimpleUploadedFile
 from rest_framework.test import APIClient
 
 from datetime import date
@@ -13,7 +14,9 @@ from .models import (
     Household,
     PDMResponse,
     PaymentChannelConfig,
+    PaymentEvent,
     PaymentInstruction,
+    Budget,
     Program,
     ProgramActivity,
     Tenant,
@@ -121,6 +124,7 @@ class RegistrationTests(TestCase):
         beneficiary = Beneficiary.objects.get(id=response.data["id"])
         self.assertEqual(beneficiary.phone_number, "+249912345678")
         self.assertEqual(beneficiary.phone_last4, "5678")
+        self.assertEqual(response.data["masked_phone"], "**** 5678")
         self.assertTrue(beneficiary.national_id_hash)
         self.assertNotEqual(beneficiary.number, "AB-123 456")
         self.assertNotIn("number", response.data)
@@ -484,6 +488,46 @@ class PDMAndAuthenticationTests(TestCase):
         mismatch = self.client.get(f"/api/pdm/?tenant={self.tenant.id}&program={mismatched_program.id}")
         self.assertEqual(mismatch.status_code, 403)
 
+    def test_import_preview_normalizes_phone_number_header(self):
+        self.client.force_authenticate(self.field_officer)
+        upload = SimpleUploadedFile(
+            "beneficiaries.csv",
+            b"client_generated_id,household_size,location,national_id,full_name,Phone Number\nHH-CSV-1,2,North,NID-CSV-1,CSV Beneficiary,+249 91 234 5678\n",
+            content_type="text/csv",
+        )
+
+        response = self.client.post("/api/imports/", {"program_id": str(self.program.id), "file": upload}, format="multipart")
+
+        self.assertEqual(response.status_code, 200, response.data)
+        self.assertEqual(response.data["rows_valid"], 1)
+        self.assertEqual(response.data["preview_rows"][0]["phone_number"], "+249912345678")
+
+    def test_reconciliation_rejects_non_object_provider_report(self):
+        self.client.force_authenticate(self.manager)
+
+        response = self.client.post("/api/ai/reconcile/", {"batch_id": "unused", "provider_report_data": []}, format="json")
+
+        self.assertEqual(response.status_code, 400)
+        self.assertIn("JSON object", response.data["error"]["message"])
+
+    def test_assigned_complaint_is_visible_on_assignee_dashboard(self):
+        beneficiary = self.create_successful_payment()
+        support = User.objects.create_user("dashboard-support@example.test", "Dashboard Support", self.tenant, "password", role=User.Role.SUPPORT)
+        Complaint.objects.create(
+            beneficiary=beneficiary,
+            category="Access",
+            description="Dashboard assignment test.",
+            assigned_to=support,
+            created_by=self.manager,
+        )
+        self.client.force_authenticate(support)
+
+        response = self.client.get("/api/reports/")
+
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(len(response.data["dashboards"]["assigned_complaints"]), 1)
+        self.assertEqual(response.data["dashboards"]["assigned_complaints"][0]["beneficiary__full_name"], beneficiary.full_name)
+
 
 class EndToEndWorkflowTests(TestCase):
     def setUp(self):
@@ -711,3 +755,128 @@ class EndToEndWorkflowTests(TestCase):
             format="json",
         )
         self.assertEqual(response.status_code, 400)
+
+
+class DeletionAccessTests(TestCase):
+    def setUp(self):
+        self.tenant = Tenant.objects.create(name="Tenant A", tenant_type="NGO", default_currency="USD")
+        self.other_tenant = Tenant.objects.create(name="Tenant B", tenant_type="NGO", default_currency="USD")
+        self.manager = User.objects.create_user("manager-delete@example.test", "Tenant Manager", self.tenant, "password", role=User.Role.MANAGER)
+        self.field_officer = User.objects.create_user("field-delete@example.test", "Field Officer", self.tenant, "password", role=User.Role.FIELD_OFFICER)
+        self.other_manager = User.objects.create_user("other-manager-delete@example.test", "Other Manager", self.other_tenant, "password", role=User.Role.MANAGER)
+        self.program = self.make_program(self.tenant, self.manager, "Tenant A program")
+        self.other_program = self.make_program(self.other_tenant, self.other_manager, "Tenant B program")
+        self.client = APIClient()
+
+    def make_program(self, tenant, creator, name):
+        return Program.objects.create(
+            tenant=tenant,
+            name=name,
+            country="Sudan",
+            country_code="SD",
+            currency="USD",
+            reporting_currency="USD",
+            transfer_amount="50.00",
+            payment_cycle=Program.Cycle.MONTHLY,
+            created_by=creator,
+        )
+
+    def make_beneficiary_graph(self, program, creator):
+        household = Household.objects.create(
+            tenant=program.tenant,
+            program=program,
+            household_size=2,
+            location="Khartoum",
+            registration_date=date.today(),
+            created_by=creator,
+        )
+        beneficiary = Beneficiary.objects.create(
+            household=household,
+            number="DELETE-001",
+            full_name="Delete Test Beneficiary",
+            created_by=creator,
+        )
+        enrollment = Enrollment.objects.create(
+            beneficiary=beneficiary,
+            program=program,
+            eligibility_status=Enrollment.EligibilityStatus.ELIGIBLE,
+            status=Enrollment.Status.APPROVED,
+            approved_by=creator,
+        )
+        channel = PaymentChannelConfig.objects.create(
+            program=program,
+            channel_type=PaymentChannelConfig.ChannelType.MOBILE_MONEY,
+            provider_name="Simulator",
+            currency="USD",
+        )
+        instruction = PaymentInstruction.objects.create(
+            enrollment=enrollment,
+            beneficiary=beneficiary,
+            channel_config=channel,
+            amount="50.00",
+            currency="USD",
+            status=PaymentInstruction.Status.SUCCESS,
+            idempotency_key=f"delete-{beneficiary.id}",
+            created_by=creator,
+        )
+        PaymentEvent.objects.create(
+            instruction=instruction,
+            event_type=PaymentEvent.EventType.SUCCESS,
+            provider_status=PaymentEvent.ProviderStatus.SETTLED,
+            to_status=PaymentInstruction.Status.SUCCESS,
+            recorded_by=creator,
+        )
+        Complaint.objects.create(
+            beneficiary=beneficiary,
+            instruction=instruction,
+            category="Access",
+            description="Deletion test complaint",
+            created_by=creator,
+        )
+        return household, beneficiary, enrollment, instruction
+
+    def test_manager_can_delete_program_and_its_protected_dependencies(self):
+        household, beneficiary, enrollment, instruction = self.make_beneficiary_graph(self.program, self.manager)
+        Budget.objects.create(program=self.program, currency="USD", planned_total="100.00")
+        self.client.force_authenticate(self.manager)
+
+        response = self.client.delete(f"/api/programs/{self.program.id}/")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Program.objects.filter(id=self.program.id).exists())
+        self.assertFalse(Household.objects.filter(id=household.id).exists())
+        self.assertFalse(Beneficiary.objects.filter(id=beneficiary.id).exists())
+        self.assertFalse(Enrollment.objects.filter(id=enrollment.id).exists())
+        self.assertFalse(PaymentInstruction.objects.filter(id=instruction.id).exists())
+        self.assertTrue(AuditEvent.objects.filter(action="PROGRAM_DELETED", entity_id=str(self.program.id)).exists())
+
+    def test_manager_can_delete_beneficiary_and_payment_dependencies(self):
+        household, beneficiary, enrollment, instruction = self.make_beneficiary_graph(self.program, self.manager)
+        self.client.force_authenticate(self.manager)
+
+        response = self.client.delete(f"/api/beneficiaries/{beneficiary.id}/")
+
+        self.assertEqual(response.status_code, 204)
+        self.assertFalse(Household.objects.filter(id=household.id).exists())
+        self.assertFalse(Beneficiary.objects.filter(id=beneficiary.id).exists())
+        self.assertFalse(Enrollment.objects.filter(id=enrollment.id).exists())
+        self.assertFalse(PaymentInstruction.objects.filter(id=instruction.id).exists())
+        self.assertTrue(AuditEvent.objects.filter(action="BENEFICIARY_DELETED").exists())
+        self.assertTrue(AuditEvent.objects.filter(action="HOUSEHOLD_DELETED_AFTER_LAST_BENEFICIARY").exists())
+
+    def test_field_officer_cannot_delete_beneficiary(self):
+        _, beneficiary, _, _ = self.make_beneficiary_graph(self.program, self.manager)
+        self.client.force_authenticate(self.field_officer)
+
+        response = self.client.delete(f"/api/beneficiaries/{beneficiary.id}/")
+
+        self.assertEqual(response.status_code, 403)
+        self.assertTrue(Beneficiary.objects.filter(id=beneficiary.id).exists())
+
+    def test_manager_cannot_delete_another_tenant_program(self):
+        self.client.force_authenticate(self.manager)
+
+        response = self.client.delete(f"/api/programs/{self.other_program.id}/")
+
+        self.assertEqual(response.status_code, 404)
+        self.assertTrue(Program.objects.filter(id=self.other_program.id).exists())

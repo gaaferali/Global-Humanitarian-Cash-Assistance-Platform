@@ -55,6 +55,7 @@ async function request<T>(path: string, init: RequestInit = {}, retry = true): P
     const payload = (await response.json().catch(() => ({}))) as ApiError;
     throw new Error(payload.error?.message ?? payload.detail ?? "Request failed");
   }
+  if (response.status === 204) return undefined as T;
   return response.json() as Promise<T>;
 }
 
@@ -110,6 +111,8 @@ export const api = {
   },
   update: <T>(resource: string, id: string, payload: Record<string, unknown>) =>
     request<T>(`/${resource}/${id}/`, { method: "PATCH", body: JSON.stringify(payload) }),
+  remove: <T>(resource: string, id: string) =>
+    request<T>(`/${resource}/${id}/`, { method: "DELETE" }),
   programChannel: <T>(programId: string, payload: Record<string, unknown>) =>
     request<T>(`/programs/${programId}/channels/`, { method: "POST", body: JSON.stringify(payload) }),
   simulatePayment: <T>(instructionId: string, outcome: "submit" | "success" | "failure" | "retry" | "reversal") =>
