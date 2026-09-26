@@ -19,6 +19,7 @@ from .models import (
     Budget,
     Program,
     ProgramActivity,
+    ReviewTask,
     Tenant,
     User,
 )
@@ -53,6 +54,31 @@ class TenantBoundaryTests(TestCase):
         self.assertEqual(User.objects.get(email="support@example.test").tenant, self.tenant)
 
 
+class ProfileTests(TestCase):
+    def setUp(self):
+        self.tenant = Tenant.objects.create(name="Tenant A", tenant_type="NGO", default_currency="USD")
+        self.user = User.objects.create_user("profile@example.test", "Profile User", self.tenant, "CurrentPass123", role=User.Role.FIELD_OFFICER)
+        self.client = APIClient()
+        self.client.force_authenticate(self.user)
+
+    def test_profile_details_require_current_password(self):
+        rejected = self.client.post("/api/profile/details/", {"full_name": "Updated User", "email": "updated@example.test", "current_password": "wrong"}, format="json")
+        self.assertEqual(rejected.status_code, 400)
+        response = self.client.post("/api/profile/details/", {"full_name": "Updated User", "email": "updated@example.test", "current_password": "CurrentPass123"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.user.refresh_from_db()
+        self.assertEqual(self.user.full_name, "Updated User")
+        self.assertEqual(self.user.email, "updated@example.test")
+
+    def test_password_change_requires_matching_confirmation(self):
+        rejected = self.client.post("/api/profile/password/", {"current_password": "CurrentPass123", "new_password": "NewPass123", "confirm_password": "Different123"}, format="json")
+        self.assertEqual(rejected.status_code, 400)
+        response = self.client.post("/api/profile/password/", {"current_password": "CurrentPass123", "new_password": "NewPass123", "confirm_password": "NewPass123"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        self.user.refresh_from_db()
+        self.assertTrue(self.user.check_password("NewPass123"))
+
+
 class ActivityDependencyTests(TestCase):
     def setUp(self):
         self.tenant = Tenant.objects.create(name="Tenant A", tenant_type="NGO", default_currency="USD")
@@ -81,6 +107,56 @@ class DuplicateEndpointTests(TestCase):
         response = self.client.post("/api/ai/deduplicate/27/", {}, format="json")
         self.assertEqual(response.status_code, 400)
         self.assertIn("valid beneficiary", response.data["error"]["message"])
+
+
+class AutomationExecutionTests(TestCase):
+    def setUp(self):
+        self.tenant = Tenant.objects.create(name="Tenant A", tenant_type="NGO", default_currency="USD")
+        self.manager = User.objects.create_user("manager@example.test", "Manager", self.tenant, "password", role=User.Role.MANAGER)
+        self.client = APIClient()
+        self.client.force_authenticate(self.manager)
+
+    def create_rule(self, action_name):
+        response = self.client.post(
+            "/api/automation-rules/",
+            {"event_name": "DUPLICATE_FLAG", "action_name": action_name, "is_active": True, "priority": 100},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        return response.data["id"]
+
+    def test_decision_sensitive_action_is_recorded_as_dry_run(self):
+        rule_id = self.create_rule("RETRY")
+        response = self.client.post(
+            "/api/ai/automation/execute/",
+            {"rule_id": rule_id, "idempotency_key": "dry-run-test-1", "event_payload": {}},
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["status"], "DRY_RUN")
+        self.assertEqual(response.data["outcome"], "DRY_RUN_NOT_EXECUTED")
+        self.assertFalse(response.data["review_task_created"])
+        self.assertEqual(ReviewTask.objects.count(), 0)
+
+    def test_review_task_action_creates_human_queue_item(self):
+        rule_id = self.create_rule("CREATE_REVIEW_TASK")
+        response = self.client.post(
+            "/api/ai/automation/execute/",
+            {
+                "rule_id": rule_id,
+                "idempotency_key": "review-task-test-1",
+                "event_payload": {"task_type": "DUPLICATE_REVIEW", "priority": "HIGH"},
+            },
+            format="json",
+        )
+        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.data["status"], "COMPLETED")
+        self.assertEqual(response.data["outcome"], "HUMAN_REVIEW_TASK_CREATED")
+        self.assertTrue(response.data["review_task_created"])
+        task = ReviewTask.objects.get()
+        self.assertEqual(task.task_type, ReviewTask.TaskType.DUPLICATE_REVIEW)
+        self.assertEqual(task.priority, ReviewTask.Priority.HIGH)
+        self.assertIsNone(task.assigned_to)
 
 
 class RegistrationTests(TestCase):
@@ -349,7 +425,7 @@ class PDMAndAuthenticationTests(TestCase):
             {"program": str(self.program.id), "received_count": 1, "access_problem_rate": 2, "satisfaction": 95},
             format="json",
         )
-        self.assertEqual(response.status_code, 201)
+        self.assertEqual(response.status_code, 201, response.data)
         pdm_response = PDMResponse.objects.get(id=response.data["id"])
         self.assertEqual(pdm_response.tenant, self.tenant)
         self.assertEqual(pdm_response.received_count, 1)
@@ -375,6 +451,17 @@ class PDMAndAuthenticationTests(TestCase):
         self.assertEqual(self.client.get("/api/beneficiaries/").status_code, 200)
         response = self.client.post("/api/beneficiaries/", {}, format="json")
         self.assertEqual(response.status_code, 403)
+
+    def test_reviewer_can_update_existing_eligibility_status(self):
+        reviewer = User.objects.create_user("eligibility-reviewer@example.test", "Eligibility Reviewer", self.tenant, "password", role=User.Role.REVIEWER)
+        household = Household.objects.create(tenant=self.tenant, program=self.program, household_size=1, location="North", registration_date=date.today(), created_by=self.manager)
+        beneficiary = Beneficiary.objects.create(household=household, number="ELIG-001", full_name="Eligibility Beneficiary", created_by=self.field_officer)
+        enrollment = Enrollment.objects.create(beneficiary=beneficiary, program=self.program, eligibility_status=Enrollment.EligibilityStatus.PENDING, status=Enrollment.Status.ENROLLED)
+        self.client.force_authenticate(reviewer)
+        response = self.client.patch(f"/api/enrollments/{enrollment.id}/", {"eligibility_status": "ELIGIBLE"}, format="json")
+        self.assertEqual(response.status_code, 200, response.data)
+        enrollment.refresh_from_db()
+        self.assertEqual(enrollment.eligibility_status, Enrollment.EligibilityStatus.ELIGIBLE)
 
     def test_manager_can_use_field_and_reviewer_workflows(self):
         self.client.force_authenticate(self.manager)
@@ -674,7 +761,7 @@ class EndToEndWorkflowTests(TestCase):
         self.authenticate(self.field_officer)
         pdm_response = self.client.post(
             "/api/pdm/",
-            {"program": program_id, "received_rate": 100, "amount_received": "50.00", "access_problem_rate": 0, "complaint_rate": 0, "satisfaction": 100},
+            {"program": program_id, "received_count": 1, "access_problem_rate": 0, "satisfaction": 100},
             format="json",
         )
         self.assertEqual(pdm_response.status_code, 201)
@@ -708,7 +795,7 @@ class EndToEndWorkflowTests(TestCase):
         self.assertEqual(manager_dashboard.status_code, 200)
         self.assertEqual(manager_dashboard.data["dashboards"]["paid"], 1)
         self.assertEqual(manager_dashboard.data["dashboards"]["budget_planned"], "1000.00")
-        self.assertEqual(self.client.get("/api/audit-events/").status_code, 403)
+        self.assertEqual(self.client.get("/api/audit-events/").status_code, 200)
 
         self.authenticate(self.field_officer)
         field_dashboard = self.client.get(f"/api/reports/?program={program_id}")

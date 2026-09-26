@@ -192,6 +192,12 @@ class BeneficiarySerializer(serializers.ModelSerializer):
         fields = "__all__"
         read_only_fields = ["created_by", "created_at"]
 
+    def to_internal_value(self, data):
+        normalized_data = data.copy()
+        if not normalized_data.get("number") and normalized_data.get("national_id"):
+            normalized_data["number"] = normalized_data["national_id"]
+        return super().to_internal_value(normalized_data)
+
     def validate_household(self, household):
         if household.tenant_id != self.context["request"].user.tenant_id:
             raise serializers.ValidationError("Household belongs to another tenant")

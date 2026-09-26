@@ -73,6 +73,10 @@ export const api = {
     return result.user;
   },
   me: () => request<PlatformUser>("/me/"),
+  updateProfile: (payload: { full_name: string; email: string; current_password: string }) =>
+    request<PlatformUser>("/profile/details/", { method: "POST", body: JSON.stringify(payload) }),
+  changePassword: (payload: { current_password: string; new_password: string; confirm_password: string }) =>
+    request<{ status: string }>("/profile/password/", { method: "POST", body: JSON.stringify(payload) }),
   get: <T>(path: string) => request<T>(path),
   post: <T>(path: string, payload: Record<string, unknown>) => request<T>(path, { method: "POST", body: JSON.stringify(payload) }),
   users: () => request<PlatformUser[] | { results: PlatformUser[] }>("/users/"),

@@ -6,6 +6,8 @@ from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 
 from django.core.serializers.json import DjangoJSONEncoder
+from django.core.exceptions import ValidationError as DjangoValidationError
+from django.core.validators import validate_email
 from django.db import transaction
 from django.db.models import Count, Q, Sum
 from django.shortcuts import get_object_or_404
@@ -278,6 +280,48 @@ def logout_view(request):
 @api_view(["GET"])
 def me_view(request):
     return Response(UserSerializer(request.user).data)
+
+
+@api_view(["POST"])
+def profile_details_view(request):
+    current_password = str(request.data.get("current_password") or "")
+    full_name = str(request.data.get("full_name") or "").strip()
+    email = str(request.data.get("email") or "").strip().lower()
+    if not request.user.check_password(current_password):
+        raise ValidationError({"current_password": "Current password is incorrect."})
+    if not full_name:
+        raise ValidationError({"full_name": "Full name is required."})
+    try:
+        validate_email(email)
+    except DjangoValidationError as exc:
+        raise ValidationError({"email": "Enter a valid work email address."}) from exc
+    if User.objects.exclude(pk=request.user.pk).filter(email__iexact=email).exists():
+        raise ValidationError({"email": "This work email is already used by another account."})
+    before = {"full_name": request.user.full_name, "email": request.user.email}
+    request.user.full_name = full_name
+    request.user.email = email
+    request.user.save(update_fields=["full_name", "email"])
+    audit(request.user, "PROFILE_DETAILS_UPDATED", request.user, before=before, after={"full_name": full_name, "email": email}, tenant=request.user.tenant)
+    return Response(UserSerializer(request.user).data)
+
+
+@api_view(["POST"])
+def profile_password_view(request):
+    current_password = str(request.data.get("current_password") or "")
+    new_password = str(request.data.get("new_password") or "")
+    confirm_password = str(request.data.get("confirm_password") or "")
+    if not request.user.check_password(current_password):
+        raise ValidationError({"current_password": "Current password is incorrect."})
+    if len(new_password) < 8:
+        raise ValidationError({"new_password": "New password must contain at least 8 characters."})
+    if new_password != confirm_password:
+        raise ValidationError({"confirm_password": "New password confirmation does not match."})
+    if request.user.check_password(new_password):
+        raise ValidationError({"new_password": "Choose a new password that is different from the current password."})
+    request.user.set_password(new_password)
+    request.user.save(update_fields=["password"])
+    audit(request.user, "PROFILE_PASSWORD_UPDATED", request.user, after={"password_changed": True}, tenant=request.user.tenant)
+    return Response({"status": "password_updated"})
 
 
 class ProgramViewSet(RoleProtectedTenantViewSet):
@@ -1179,6 +1223,31 @@ def ai_automation_status_view(request):
     return Response({"status": "accepted", "action": action_name, "execution": "controlled", "advisory_only": True})
 
 
+def automation_execution_response(execution):
+    data = AutomationExecutionSerializer(execution).data
+    planned_action = execution.planned_action or {}
+    review_task_id = planned_action.get("review_task_id")
+    if execution.status == AutomationExecution.Status.COMPLETED:
+        data.update({
+            "outcome": "HUMAN_REVIEW_TASK_CREATED",
+            "message": "A human review task was added to the review queue. No payment or eligibility decision was made.",
+            "review_task_created": bool(review_task_id),
+        })
+    elif execution.status == AutomationExecution.Status.DRY_RUN:
+        data.update({
+            "outcome": "DRY_RUN_NOT_EXECUTED",
+            "message": "No automatic payment, eligibility, fraud, or escalation action was executed. A human must make the decision.",
+            "review_task_created": False,
+        })
+    else:
+        data.update({
+            "outcome": execution.status,
+            "message": "The controlled automation request was recorded for review.",
+            "review_task_created": bool(review_task_id),
+        })
+    return data
+
+
 @api_view(["POST"])
 def automation_execute_view(request):
     if request.user.role not in {User.Role.ADMIN, User.Role.MANAGER}:
@@ -1190,33 +1259,43 @@ def automation_execute_view(request):
     idempotency_key = request.data.get("idempotency_key")
     if not idempotency_key:
         raise ValidationError({"idempotency_key": "Required to prevent duplicate execution"})
-    execution, created = AutomationExecution.objects.get_or_create(
-        tenant=rule.tenant,
-        rule=rule,
-        idempotency_key=idempotency_key,
-        defaults={"event_payload": request.data.get("event_payload", {}), "planned_action": {"action": rule.action_name}, "status": AutomationExecution.Status.BLOCKED},
-    )
-    if not created:
-        return Response(AutomationExecutionSerializer(execution).data)
+    event_payload = request.data.get("event_payload", {})
+    if not isinstance(event_payload, dict):
+        raise ValidationError({"event_payload": "Provide event details as a JSON object."})
     if rule.action_name == "CREATE_REVIEW_TASK":
-        payload = request.data.get("event_payload", {})
-        _review_task = ReviewTask.objects.create(
+        task_type = event_payload.get("task_type", ReviewTask.TaskType.DATA_QUALITY)
+        priority = event_payload.get("priority", ReviewTask.Priority.MEDIUM)
+        if task_type not in ReviewTask.TaskType.values:
+            raise ValidationError({"event_payload": {"task_type": "Choose a valid human review type."}})
+        if priority not in ReviewTask.Priority.values:
+            raise ValidationError({"event_payload": {"priority": "Choose a valid priority."}})
+    with transaction.atomic():
+        execution, created = AutomationExecution.objects.get_or_create(
             tenant=rule.tenant,
-            program=rule.program,
-            task_type=payload.get("task_type", ReviewTask.TaskType.DATA_QUALITY),
-            entity_type=payload.get("entity_type", "AUTOMATION_EVENT"),
-            entity_id=str(payload.get("entity_id", execution.id)),
-            priority=payload.get("priority", ReviewTask.Priority.MEDIUM),
-            resolution="Created by controlled automation; human resolution required.",
+            rule=rule,
+            idempotency_key=idempotency_key,
+            defaults={"event_payload": event_payload, "planned_action": {"action": rule.action_name}, "status": AutomationExecution.Status.BLOCKED},
         )
-        execution.status = AutomationExecution.Status.COMPLETED
-        execution.planned_action = {"action": rule.action_name, "review_task_id": str(_review_task.id)}
-    else:
-        execution.status = AutomationExecution.Status.DRY_RUN
-        execution.planned_action = {"action": rule.action_name, "reason": "Decision-sensitive actions remain human controlled."}
-    execution.save(update_fields=["status", "planned_action"])
-    audit(request.user, "AUTOMATION_EXECUTED", execution, after=AutomationExecutionSerializer(execution).data, tenant=rule.tenant)
-    return Response(AutomationExecutionSerializer(execution).data, status=status.HTTP_201_CREATED)
+        if not created:
+            return Response(automation_execution_response(execution))
+        if rule.action_name == "CREATE_REVIEW_TASK":
+            _review_task = ReviewTask.objects.create(
+                tenant=rule.tenant,
+                program=rule.program,
+                task_type=task_type,
+                entity_type=event_payload.get("entity_type", "AUTOMATION_EVENT"),
+                entity_id=str(event_payload.get("entity_id", execution.id)),
+                priority=priority,
+                resolution="Created by controlled automation; human resolution required.",
+            )
+            execution.status = AutomationExecution.Status.COMPLETED
+            execution.planned_action = {"action": rule.action_name, "review_task_id": str(_review_task.id)}
+        else:
+            execution.status = AutomationExecution.Status.DRY_RUN
+            execution.planned_action = {"action": rule.action_name, "reason": "Decision-sensitive actions remain human controlled."}
+        execution.save(update_fields=["status", "planned_action"])
+        audit(request.user, "AUTOMATION_EXECUTED", execution, after=AutomationExecutionSerializer(execution).data, tenant=rule.tenant)
+    return Response(automation_execution_response(execution), status=status.HTTP_201_CREATED)
 
 
 @api_view(["POST"])

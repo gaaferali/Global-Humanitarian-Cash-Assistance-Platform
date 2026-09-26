@@ -37,6 +37,8 @@ from .views import (
     ai_copilot_view,
     automation_execute_view,
     pipeline_status_view,
+    profile_details_view,
+    profile_password_view,
 )
 
 router = DefaultRouter()
@@ -65,6 +67,8 @@ urlpatterns = [
     path("auth/refresh/", TokenRefreshView.as_view()),
     path("auth/logout/", logout_view),
     path("me/", me_view),
+    path("profile/details/", profile_details_view),
+    path("profile/password/", profile_password_view),
     path("reports/", reports_view),
     path("reporting/programs/<uuid:program_id>/summary/", program_summary_view),
     path("imports/", imports_view),
