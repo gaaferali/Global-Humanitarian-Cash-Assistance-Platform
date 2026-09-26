@@ -8,8 +8,11 @@ from .models import (
     AuditEvent,
     AutomationRule,
     Beneficiary,
+    Complaint,
+    Enrollment,
     Household,
     PDMResponse,
+    PaymentChannelConfig,
     PaymentInstruction,
     Program,
     ProgramActivity,
@@ -253,6 +256,47 @@ class PDMAndAuthenticationTests(TestCase):
         )
         self.client = APIClient()
 
+    def create_successful_payment(self):
+        household = Household.objects.create(
+            tenant=self.tenant,
+            program=self.program,
+            household_size=1,
+            location="North",
+            registration_date=date.today(),
+            created_by=self.field_officer,
+        )
+        beneficiary = Beneficiary.objects.create(
+            household=household,
+            number="PDM-001",
+            full_name="PDM Beneficiary",
+            consent_given=True,
+            created_by=self.field_officer,
+        )
+        enrollment = Enrollment.objects.create(
+            beneficiary=beneficiary,
+            program=self.program,
+            eligibility_status=Enrollment.EligibilityStatus.ELIGIBLE,
+            status=Enrollment.Status.APPROVED,
+            approved_by=self.manager,
+        )
+        channel = PaymentChannelConfig.objects.create(
+            program=self.program,
+            channel_type=PaymentChannelConfig.ChannelType.MOBILE_MONEY,
+            provider_name="Simulator",
+            currency="USD",
+        )
+        PaymentInstruction.objects.create(
+            enrollment=enrollment,
+            beneficiary=beneficiary,
+            channel_config=channel,
+            amount="50.00",
+            currency="USD",
+            status=PaymentInstruction.Status.SUCCESS,
+            idempotency_key="pdm-success-payment",
+            created_by=self.manager,
+        )
+        return beneficiary
+
     def test_jwt_login_can_call_current_user_endpoint(self):
         login_response = self.client.post(
             "/api/auth/login/",
@@ -287,18 +331,73 @@ class PDMAndAuthenticationTests(TestCase):
         )
         self.assertEqual(refresh_response.status_code, 401)
 
-    def test_field_officer_can_submit_pdm_without_channel_or_location(self):
+    def test_field_officer_pdm_uses_successful_payment_and_complaint_data(self):
+        beneficiary = self.create_successful_payment()
+        Complaint.objects.create(
+            beneficiary=beneficiary,
+            category="Access",
+            description="Assistance was delayed.",
+            created_by=self.manager,
+        )
         self.client.force_authenticate(self.field_officer)
         response = self.client.post(
             "/api/pdm/",
-            {"program": str(self.program.id), "received_rate": 98, "amount_received": 50, "access_problem_rate": 2, "complaint_rate": 1, "satisfaction": 95},
+            {"program": str(self.program.id), "received_count": 1, "access_problem_rate": 2, "satisfaction": 95},
             format="json",
         )
         self.assertEqual(response.status_code, 201)
         pdm_response = PDMResponse.objects.get(id=response.data["id"])
         self.assertEqual(pdm_response.tenant, self.tenant)
-        self.assertEqual(pdm_response.channel, "UNSPECIFIED")
-        self.assertEqual(pdm_response.location, "UNSPECIFIED")
+        self.assertEqual(pdm_response.received_count, 1)
+        self.assertEqual(str(pdm_response.amount_received), "50.00")
+        self.assertEqual(str(pdm_response.complaint_rate), "100.00")
+        summary = self.client.get(f"/api/pdm/summary/?program={self.program.id}")
+        self.assertEqual(summary.status_code, 200)
+        self.assertEqual(summary.data["paid_beneficiaries"], 1)
+        self.assertEqual(summary.data["recorded_recipients"], 1)
+        self.assertEqual(summary.data["remaining_recipients"], 0)
+        self.assertEqual(summary.data["complaints"], 1)
+
+    def test_support_pdm_access_is_summary_only(self):
+        support = User.objects.create_user("support@example.test", "Support", self.tenant, "password", role=User.Role.SUPPORT)
+        self.client.force_authenticate(support)
+        self.assertEqual(self.client.get("/api/pdm/summary/").status_code, 200)
+        response = self.client.post("/api/pdm/", {"program": str(self.program.id), "received_count": 1}, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_reviewer_can_view_beneficiaries_but_cannot_register_them(self):
+        reviewer = User.objects.create_user("reviewer@example.test", "Reviewer", self.tenant, "password", role=User.Role.REVIEWER)
+        self.client.force_authenticate(reviewer)
+        self.assertEqual(self.client.get("/api/beneficiaries/").status_code, 200)
+        response = self.client.post("/api/beneficiaries/", {}, format="json")
+        self.assertEqual(response.status_code, 403)
+
+    def test_manager_can_use_field_and_reviewer_workflows(self):
+        self.client.force_authenticate(self.manager)
+        household_response = self.client.post(
+            "/api/households/",
+            {"program": str(self.program.id), "household_size": 3, "location": "North", "registration_date": str(date.today())},
+            format="json",
+        )
+        self.assertEqual(household_response.status_code, 201)
+        beneficiary_response = self.client.post(
+            "/api/beneficiaries/",
+            {"household": household_response.data["id"], "national_id": "manager-001", "number": "manager-001", "full_name": "Manager Registered", "gender": "F", "consent_given": True},
+            format="json",
+        )
+        self.assertEqual(beneficiary_response.status_code, 201, beneficiary_response.data)
+        enrollment_response = self.client.post(
+            "/api/enrollments/",
+            {"program": str(self.program.id), "beneficiary": beneficiary_response.data["id"], "eligibility_status": "ELIGIBLE", "status": "ENROLLED"},
+            format="json",
+        )
+        self.assertEqual(enrollment_response.status_code, 201)
+        decision_response = self.client.patch(
+            f"/api/enrollments/{enrollment_response.data['id']}/",
+            {"status": "APPROVED"},
+            format="json",
+        )
+        self.assertEqual(decision_response.status_code, 200)
 
     def test_field_officer_cannot_request_another_tenant_pdm_summary(self):
         self.client.force_authenticate(self.field_officer)

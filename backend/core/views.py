@@ -2,6 +2,7 @@ import uuid
 import json
 import csv
 import io
+from decimal import Decimal, ROUND_HALF_UP
 from hashlib import sha256
 
 from django.core.serializers.json import DjangoJSONEncoder
@@ -345,8 +346,8 @@ class ActivityDependencyViewSet(RoleProtectedTenantViewSet):
 class HouseholdViewSet(RoleProtectedTenantViewSet):
     queryset = Household.objects.select_related("program")
     serializer_class = HouseholdSerializer
-    allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER}
-    write_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER}
+    allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER, User.Role.MANAGER}
+    write_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.MANAGER}
 
 
 class BeneficiaryViewSet(RoleProtectedTenantViewSet):
@@ -354,7 +355,7 @@ class BeneficiaryViewSet(RoleProtectedTenantViewSet):
     serializer_class = BeneficiarySerializer
     tenant_field = "household__tenant"
     allowed_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER, User.Role.SUPPORT, User.Role.MANAGER, User.Role.AUDITOR}
-    write_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.REVIEWER}
+    write_roles = {User.Role.ADMIN, User.Role.FIELD_OFFICER, User.Role.MANAGER}
 
 
 class EnrollmentViewSet(RoleProtectedTenantViewSet):
@@ -362,7 +363,7 @@ class EnrollmentViewSet(RoleProtectedTenantViewSet):
     serializer_class = EnrollmentSerializer
     tenant_field = "program__tenant"
     allowed_roles = {User.Role.ADMIN, User.Role.REVIEWER, User.Role.FINANCE, User.Role.MANAGER, User.Role.AUDITOR}
-    write_roles = {User.Role.ADMIN, User.Role.REVIEWER}
+    write_roles = {User.Role.ADMIN, User.Role.REVIEWER, User.Role.MANAGER}
 
 
 class PaymentInstructionViewSet(RoleProtectedTenantViewSet):
@@ -809,9 +810,29 @@ def imports_view(request):
     }, status=status.HTTP_201_CREATED)
 
 
+def pdm_program_metrics(program, responses=None):
+    successful_payments = PaymentInstruction.objects.filter(
+        enrollment__program=program,
+        status=PaymentInstruction.Status.SUCCESS,
+    )
+    paid_beneficiaries = successful_payments.values("beneficiary_id").distinct().count()
+    distributed_amount = successful_payments.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    recorded_recipients = (responses or PDMResponse.objects.filter(program=program)).aggregate(total=Sum("received_count"))["total"] or 0
+    complaints = Complaint.objects.filter(beneficiary__household__program=program).count()
+    return {
+        "paid_beneficiaries": paid_beneficiaries,
+        "distributed_amount": distributed_amount,
+        "recorded_recipients": recorded_recipients,
+        "remaining_recipients": max(paid_beneficiaries - recorded_recipients, 0),
+        "complaints": complaints,
+        "complaint_rate": (Decimal(complaints) * Decimal("100") / Decimal(paid_beneficiaries)).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP) if paid_beneficiaries else Decimal("0"),
+    }
+
+
 @api_view(["GET", "POST"])
 def pdm_view(request):
-    if request.user.role not in {User.Role.ADMIN, User.Role.SUPPORT, User.Role.FIELD_OFFICER, User.Role.MANAGER, User.Role.AUDITOR}:
+    permitted_roles = {User.Role.ADMIN, User.Role.SUPPORT, User.Role.FIELD_OFFICER, User.Role.MANAGER, User.Role.AUDITOR}
+    if request.user.role not in permitted_roles:
         raise PermissionDenied("Your role does not have permission for PDM")
     if request.method == "GET":
         responses = PDMResponse.objects.all() if request.user.is_superuser else PDMResponse.objects.filter(tenant=request.user.tenant)
@@ -825,19 +846,38 @@ def pdm_view(request):
             if requested_tenant and str(program.tenant_id) != str(requested_tenant):
                 raise PermissionDenied("The selected program does not belong to the selected tenant")
             responses = responses.filter(program=program)
-        return Response(list(responses.values("id", "tenant", "tenant__name", "program", "program__name", "channel", "location", "received_rate", "amount_received", "access_problem_rate", "complaint_rate", "satisfaction", "created_at")))
-    if request.user.role == User.Role.AUDITOR:
-        raise PermissionDenied("Auditors have read-only PDM access")
-    required = [field for field in ("program", "received_rate") if request.data.get(field) in {None, ""}]
-    if required:
-        raise ValidationError({field: "Required" for field in required})
-    program = scoped_program(request, request.data.get("program"))
-    channel_values = PaymentChannelConfig.objects.filter(program=program, is_active=True).order_by("provider_name").values_list("channel_type", flat=True)[:1]
-    location_values = Household.objects.filter(program=program).order_by("registration_date").values_list("location", flat=True)[:1]
-    channel = request.data.get("channel") or next(iter(channel_values), "UNSPECIFIED")
-    location = request.data.get("location") or next(iter(location_values), "UNSPECIFIED")
-    response = PDMResponse.objects.create(tenant=program.tenant, program=program, channel=channel, location=location, received_rate=request.data.get("received_rate", 0), amount_received=request.data.get("amount_received", 0), access_problem_rate=request.data.get("access_problem_rate", 0), complaint_rate=request.data.get("complaint_rate", 0), satisfaction=request.data.get("satisfaction", 0), created_by=request.user)
-    audit(request.user, "PDM_RESPONSE_CREATED", response, after={"program": str(program.id), "channel": response.channel, "location": response.location}, tenant=program.tenant)
+        return Response(list(responses.values("id", "tenant", "tenant__name", "program", "program__name", "channel", "location", "received_count", "received_rate", "amount_received", "access_problem_rate", "complaint_rate", "satisfaction", "created_at")))
+
+    if request.user.role in {User.Role.AUDITOR, User.Role.SUPPORT}:
+        raise PermissionDenied("Your PDM access is limited to summaries")
+    if request.data.get("program") in {None, ""} or request.data.get("received_count") in {None, ""}:
+        raise ValidationError({"program": "Required", "received_count": "Enter the number of people who received assistance."})
+    try:
+        received_count = int(request.data["received_count"])
+    except (TypeError, ValueError):
+        raise ValidationError({"received_count": "Enter a whole number."})
+    if received_count < 1:
+        raise ValidationError({"received_count": "Enter at least one recipient."})
+    program = scoped_program(request, request.data["program"])
+    existing_responses = PDMResponse.objects.filter(program=program)
+    metrics = pdm_program_metrics(program, existing_responses)
+    if not metrics["paid_beneficiaries"]:
+        raise ValidationError({"received_count": "No successfully simulated payments are available for this program yet."})
+    if received_count > metrics["remaining_recipients"]:
+        raise ValidationError({"received_count": f"Only {metrics['remaining_recipients']} recipients remain to be recorded for this program."})
+    try:
+        access_problem_rate = Decimal(str(request.data.get("access_problem_rate") or 0))
+        satisfaction = Decimal(str(request.data.get("satisfaction") or 0))
+    except Exception:
+        raise ValidationError("Access problem rate and satisfaction must be numbers.")
+    if any(value < 0 or value > 100 for value in (access_problem_rate, satisfaction)):
+        raise ValidationError("Access problem rate and satisfaction must be between 0 and 100.")
+    channel = PaymentChannelConfig.objects.filter(program=program, is_active=True).order_by("provider_name").values_list("channel_type", flat=True).first() or "UNSPECIFIED"
+    location = Household.objects.filter(program=program).order_by("registration_date").values_list("location", flat=True).first() or "UNSPECIFIED"
+    received_rate = (Decimal(received_count) * Decimal("100") / Decimal(metrics["paid_beneficiaries"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    amount_received = (metrics["distributed_amount"] * Decimal(received_count) / Decimal(metrics["paid_beneficiaries"])).quantize(Decimal("0.01"), rounding=ROUND_HALF_UP)
+    response = PDMResponse.objects.create(tenant=program.tenant, program=program, channel=channel, location=location, received_count=received_count, received_rate=received_rate, amount_received=amount_received, access_problem_rate=access_problem_rate, complaint_rate=metrics["complaint_rate"], satisfaction=satisfaction, created_by=request.user)
+    audit(request.user, "PDM_RESPONSE_CREATED", response, after={"program": str(program.id), "received_count": received_count}, tenant=program.tenant)
     return Response({"status": "created", "id": str(response.id), "submitted_at": response.created_at}, status=status.HTTP_201_CREATED)
 
 
@@ -865,8 +905,21 @@ def pdm_summary_view(request):
                 responses = responses.filter(program=selected_program)
             else:
                 responses = responses.filter(**{field: request.query_params[field]})
-    totals = responses.aggregate(received_rate=Sum("received_rate"), amount_received=Sum("amount_received"), access_problem_rate=Sum("access_problem_rate"), complaint_rate=Sum("complaint_rate"), satisfaction=Sum("satisfaction"), count=Count("id"))
+    summary_programs = Program.objects.all() if request.user.is_superuser else Program.objects.filter(tenant=request.user.tenant)
+    if selected_tenant:
+        summary_programs = summary_programs.filter(tenant=selected_tenant)
+    if selected_program:
+        summary_programs = summary_programs.filter(id=selected_program.id)
+    successful_payments = PaymentInstruction.objects.filter(
+        enrollment__program__in=summary_programs,
+        status=PaymentInstruction.Status.SUCCESS,
+    )
+    paid_beneficiaries = successful_payments.values("beneficiary_id").distinct().count()
+    distributed_amount = successful_payments.aggregate(total=Sum("amount"))["total"] or Decimal("0")
+    complaints = Complaint.objects.filter(beneficiary__household__program__in=summary_programs).count()
+    totals = responses.aggregate(received_count=Sum("received_count"), amount_received=Sum("amount_received"), access_problem_rate=Sum("access_problem_rate"), satisfaction=Sum("satisfaction"), count=Count("id"))
     count = totals["count"] or 0
+    recorded_recipients = totals["received_count"] or 0
     channels = list(responses.exclude(channel="").values_list("channel", flat=True).distinct().order_by("channel"))
     locations = list(responses.exclude(location="").values_list("location", flat=True).distinct().order_by("location"))
     return Response({
@@ -874,10 +927,15 @@ def pdm_summary_view(request):
         "tenant": {"id": str(selected_tenant.id), "name": selected_tenant.name} if selected_tenant else None,
         "channels": channels,
         "locations": locations,
-        "received_rate": float(totals["received_rate"] / count) if count else 0,
+        "paid_beneficiaries": paid_beneficiaries,
+        "recorded_recipients": recorded_recipients,
+        "remaining_recipients": max(paid_beneficiaries - recorded_recipients, 0),
+        "distributed_amount": str(distributed_amount),
+        "complaints": complaints,
+        "received_rate": float(Decimal(recorded_recipients) * Decimal("100") / Decimal(paid_beneficiaries)) if paid_beneficiaries else 0,
         "amount_received": str(totals["amount_received"] or 0),
         "access_problem_rate": float(totals["access_problem_rate"] / count) if count else 0,
-        "complaint_rate": float(totals["complaint_rate"] / count) if count else 0,
+        "complaint_rate": float(Decimal(complaints) * Decimal("100") / Decimal(paid_beneficiaries)) if paid_beneficiaries else 0,
         "satisfaction": float(totals["satisfaction"] / count) if count else 0,
         "responses": count,
     })

@@ -278,6 +278,7 @@ class PDMResponse(models.Model):
     program = models.ForeignKey(Program, on_delete=models.PROTECT, related_name="pdm_responses")
     channel = models.CharField(max_length=120)
     location = models.CharField(max_length=255)
+    received_count = models.PositiveIntegerField(default=0)
     received_rate = models.DecimalField(max_digits=5, decimal_places=2)
     amount_received = models.DecimalField(max_digits=18, decimal_places=2, default=0)
     access_problem_rate = models.DecimalField(max_digits=5, decimal_places=2, default=0)

@@ -320,6 +320,7 @@ class PaymentBatchSerializer(serializers.ModelSerializer):
 
 class ComplaintSerializer(serializers.ModelSerializer):
     beneficiary_name = serializers.CharField(source="beneficiary.full_name", read_only=True)
+    program_name = serializers.CharField(source="beneficiary.household.program.name", read_only=True)
     household_reference = serializers.SerializerMethodField()
     assigned_to_name = serializers.CharField(source="assigned_to.full_name", read_only=True)
 
